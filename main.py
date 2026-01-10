@@ -3,13 +3,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
 from supabase_client import supabase
+from typing import Optional
 
 app = FastAPI()
 
 # ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:9100",
+        "http://127.0.0.1:9100",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -19,6 +25,17 @@ app.add_middleware(
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+class EmployeeLoginRequest(BaseModel):
+    email: str
+    password: str
+
+class CampaignCreate(BaseModel):
+    campaign_name: str
+    notification_type: str
+    city_filter: Optional[str] = None
+    content: str
+    created_by: int
 
 # ---------------- ROOT ----------------
 @app.get("/")
@@ -42,7 +59,6 @@ def user_login(payload: LoginRequest):
 
     user = res.data[0]
 
-    # ⚠️ Plain-text check (OK for demo)
     if user["password"] != payload.password:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
@@ -52,85 +68,7 @@ def user_login(payload: LoginRequest):
         "name": user["name"],
     }
 
-# ---------------- USER PREFERENCES ----------------
-@app.get("/users/{user_id}/preferences")
-def get_user_preferences(user_id: str):
-    # 1️⃣ Try to fetch existing preferences
-    res = (
-        supabase
-        .table("user_preferences")
-        .select("*")
-        .eq("user_id", user_id)
-        .execute()
-    )
-
-    if res.data:
-        return res.data[0]
-
-    # 2️⃣ If not found → create default preferences
-    default_prefs = {
-        "user_id": user_id,
-        "offers": True,
-        "order_updates": True,
-        "newsletter": True,
-        "email_channel": True,
-        "sms_channel": False,
-        "push_channel": False,
-        "updated_at": datetime.utcnow().isoformat(),
-    }
-
-    insert_res = (
-        supabase
-        .table("user_preferences")
-        .insert(default_prefs)
-        .execute()
-    )
-
-    if not insert_res.data:
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to create user preferences"
-        )
-
-    return insert_res.data[0]
-
-from pydantic import BaseModel
-
-# ---------------- PREFERENCES MODEL ----------------
-class PreferenceUpdate(BaseModel):
-    offers: bool
-    order_updates: bool
-    newsletter: bool
-    email_channel: bool
-    sms_channel: bool
-    push_channel: bool
-
-# ---------------- UPDATE USER PREFERENCES ----------------
-@app.put("/users/{user_id}/preferences")
-def update_user_preferences(user_id: str, payload: PreferenceUpdate):
-    res = (
-        supabase
-        .table("user_preferences")
-        .update(payload.dict())
-        .eq("user_id", user_id)
-        .execute()
-    )
-
-    if not res.data:
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to update preferences"
-        )
-
-    return {
-        "status": "success",
-        "preferences": res.data[0]
-    }
-
-class EmployeeLoginRequest(BaseModel):
-    email: str
-    password: str
-
+# ---------------- EMPLOYEE LOGIN ----------------
 @app.post("/auth/employee/login")
 def employee_login(payload: EmployeeLoginRequest):
     res = (
@@ -152,6 +90,48 @@ def employee_login(payload: EmployeeLoginRequest):
     return {
         "employee_id": employee["employee_id"],
         "email": employee["email"],
-        "role_id": employee["role_id"],  # ✅ THIS is critical
+        "role_id": employee["role_id"],
     }
 
+# ---------------- CAMPAIGNS ----------------
+@app.get("/campaigns")
+def list_campaigns():
+    try:
+        res = (
+            supabase
+            .table("campaigns")
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/campaigns")
+def create_campaign(payload: CampaignCreate):
+    print("👉 PAYLOAD RECEIVED:", payload)
+
+    try:
+        res = (
+            supabase
+            .table("campaigns")
+            .insert({
+                "campaign_name": payload.campaign_name,
+                "notification_type": payload.notification_type,
+                "city_filter": payload.city_filter,
+                "content": payload.content,
+                "created_by": payload.created_by,  # MUST be int
+                "status": "draft",
+            })
+            .execute()
+        )
+
+        print("👉 SUPABASE RESPONSE DATA:", res.data)
+
+        return res.data[0]
+
+    except Exception as e:
+        print("❌ ERROR WHILE INSERTING CAMPAIGN:", e)
+        raise HTTPException(status_code=500, detail=str(e))
