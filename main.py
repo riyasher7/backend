@@ -139,115 +139,6 @@ def create_campaign(payload: CampaignCreate):
         print("ERROR WHILE INSERTING CAMPAIGN:", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get("/campaigns/{campaign_id}/recipients")
-def get_campaign_recipients(campaign_id: str):
-    # 1️⃣ Fetch campaign
-    campaign_res = (
-        supabase
-        .table("campaigns")
-        .select("*")
-        .eq("campaign_id", campaign_id)
-        .single()
-        .execute()
-    )
-
-    if not campaign_res.data:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-
-    campaign = campaign_res.data
-
-    # 2️⃣ Fetch active users + preferences
-    users_res = (
-        supabase
-        .table("users")
-        .select("user_id, name, email, city, user_preferences(*)")
-        .eq("is_active", True)
-        .execute()
-    )
-
-    eligible_users = []
-
-    for user in users_res.data:
-        prefs = user.get("user_preferences")
-        if not prefs:
-            continue
-
-
-        # City filter
-        if campaign["city_filter"] and user["city"] != campaign["city_filter"]:
-            continue
-
-        # Preference check
-        notif_type = campaign["notification_type"]  # offers / order_updates / newsletter
-        if not prefs.get(notif_type):
-            continue
-
-        eligible_users.append({
-            "user_id": user["user_id"],
-            "name": user["name"],
-            "email": user["email"],
-            "city": user["city"]
-        })
-
-    return {
-        "campaign_id": campaign_id,
-        "total": len(eligible_users),
-        "recipients": eligible_users
-    }
-
-
-@app.get("/campaigns/{campaign_id}/recipients")
-def get_campaign_recipients(campaign_id: str):
-    campaign_res = (
-        supabase
-        .table("campaigns")
-        .select("*")
-        .eq("campaign_id", campaign_id)
-        .single()
-        .execute()
-    )
-
-    campaign = campaign_res.data
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-
-    users_query = (
-        supabase
-        .table("users")
-        .select(
-            "user_id, name, email, city, user_preferences"
-        )
-        .eq("is_active", True)
-    )
-
-    if campaign["city_filter"]:
-        users_query = users_query.eq("city", campaign["city_filter"])
-
-    users_res = users_query.execute()
-    users = users_res.data or []
-
-    eligible_users = []
-
-    for user in users:
-        prefs = user.get("user_preferences")
-
-        # ✅ prefs is a DICT or None — NEVER a list
-        if not isinstance(prefs, dict):
-            continue
-
-        pref_key = campaign["notification_type"]
-
-        if prefs.get(pref_key) is True:
-            eligible_users.append({
-                "user_id": user["user_id"],
-                "name": user["name"],
-                "email": user["email"],
-                "city": user["city"],
-            })
-
-    return eligible_users
-
 # ---------------- USER MANAGEMENT ----------------
 
 def build_default_password(name: str, phone: str) -> str:
@@ -384,3 +275,89 @@ def upload_users_csv(file: UploadFile = File(...)):
 
     return {"created": len(users)}
 
+
+@app.post("/campaigns/{campaign_id}/send")
+def send_campaign(campaign_id: str):
+    # Fetch campaign
+    campaign_res = (
+        supabase
+        .table("campaigns")
+        .select("*")
+        .eq("campaign_id", campaign_id)
+        .single()
+        .execute()
+    )
+
+    campaign = campaign_res.data
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Get eligible recipients
+    recipients = get_campaign_recipients(campaign_id)["recipients"]
+
+    logs = []
+    for user in recipients:
+        logs.append({
+            "log_id": str(uuid.uuid4()),
+            "campaign_id": campaign_id,
+            "user_id": user["user_id"],
+            "status": "success",
+            "sent_at": datetime.utcnow().isoformat()
+        })
+
+    if logs:
+        supabase.table("campaign_logs").insert(logs).execute()
+
+    # Update campaign status
+    supabase.table("campaigns").update({
+        "status": "sent",
+        "sent_at": datetime.utcnow().isoformat()
+    }).eq("campaign_id", campaign_id).execute()
+
+    return {
+        "sent_to": len(logs),
+        "status": "sent"
+    }
+
+@app.post("/campaigns/{campaign_id}/send")
+def send_campaign(campaign_id: str):
+    # Fetch campaign
+    campaign_res = (
+        supabase
+        .table("campaigns")
+        .select("*")
+        .eq("campaign_id", campaign_id)
+        .single()
+        .execute()
+    )
+
+    campaign = campaign_res.data
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Get eligible recipients
+    recipients = get_campaign_recipients(campaign_id)["recipients"]
+
+    logs = []
+    for user in recipients:
+        logs.append({
+            "log_id": str(uuid.uuid4()),
+            "campaign_id": campaign_id,
+            "user_id": user["user_id"],
+            "status": "success",
+            "sent_at": datetime.utcnow().isoformat()
+        })
+
+    if logs:
+        supabase.table("campaign_logs").insert(logs).execute()
+
+    # Update campaign status
+    supabase.table("campaigns").update({
+        "status": "sent",
+        "sent_at": datetime.utcnow().isoformat()
+    }).eq("campaign_id", campaign_id).execute()
+
+    return {
+        "sent_to": len(logs),
+        "status": "sent"
+    }
