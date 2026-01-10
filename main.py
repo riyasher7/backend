@@ -154,3 +154,4 @@ def employee_login(payload: EmployeeLoginRequest):
         "email": employee["email"],
         "role_id": employee["role_id"],  # ✅ THIS is critical
     }
+
