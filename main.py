@@ -1,11 +1,12 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile
-import csv
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
 from supabase_client import supabase
 from typing import Optional
+from uuid import UUID
 import uuid
+import csv
 
 app = FastAPI()
 
@@ -39,12 +40,26 @@ class CampaignCreate(BaseModel):
     content: str
     created_by: int
 
+class CreateUserRequest(BaseModel):
+    name: str
+    email: str
+    phone: str
+    city: str
+    gender: Optional[str] = None
+
+class UpdateUserRequest(BaseModel):
+    name: str
+    email: str
+    phone: str
+    city: str
+    gender: Optional[str] = None
+
 # ---------------- ROOT ----------------
 @app.get("/")
 def root():
     return {"status": "ok"}
 
-# ---------------- USER LOGIN ----------------
+# ---------------- AUTH ----------------
 @app.post("/auth/user/login")
 def user_login(payload: LoginRequest):
     res = (
@@ -70,7 +85,6 @@ def user_login(payload: LoginRequest):
         "name": user["name"],
     }
 
-# ---------------- EMPLOYEE LOGIN ----------------
 @app.post("/auth/employee/login")
 def employee_login(payload: EmployeeLoginRequest):
     res = (
@@ -98,64 +112,118 @@ def employee_login(payload: EmployeeLoginRequest):
 # ---------------- CAMPAIGNS ----------------
 @app.get("/campaigns")
 def list_campaigns():
-    try:
-        res = (
-            supabase
-            .table("campaigns")
-            .select("*")
-            .order("created_at", desc=True)
-            .execute()
-        )
-        return res.data or []
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+    return (
+        supabase
+        .table("campaigns")
+        .select("*")
+        .order("created_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
 
 @app.post("/campaigns")
 def create_campaign(payload: CampaignCreate):
-    print("👉 PAYLOAD RECEIVED:", payload)
+    res = (
+        supabase
+        .table("campaigns")
+        .insert({
+            "campaign_name": payload.campaign_name,
+            "notification_type": payload.notification_type,
+            "city_filter": payload.city_filter,
+            "content": payload.content,
+            "created_by": payload.created_by,
+            "status": "draft",
+        })
+        .execute()
+    )
+    return res.data[0]
 
-    try:
-        res = (
-            supabase
-            .table("campaigns")
-            .insert({
-                "campaign_name": payload.campaign_name,
-                "notification_type": payload.notification_type,
-                "city_filter": payload.city_filter,
-                "content": payload.content,
-                "created_by": payload.created_by,  # MUST be int
-                "status": "draft",
-            })
-            .execute()
-        )
+@app.get("/campaigns/{campaign_id}/recipients")
+def get_campaign_recipients(campaign_id: UUID):
+    campaign = (
+        supabase
+        .table("campaigns")
+        .select("city_filter, notification_type")
+        .eq("campaign_id", str(campaign_id))
+        .single()
+        .execute()
+    )
 
-        print("👉 SUPABASE RESPONSE DATA:", res.data)
+    if not campaign.data:
+        return []
 
-        return res.data[0]
+    city = campaign.data["city_filter"]
+    notif_type = campaign.data["notification_type"]
 
-    except Exception as e:
-        print("❌ ERROR WHILE INSERTING CAMPAIGN:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+    preference_column = {
+        "Promotional Offers": "offers",
+        "Order Updates": "order_updates",
+        "Newsletter": "newsletter",
+    }.get(notif_type)
 
-# ---------------- USER MANAGEMENT ----------------
+    if not preference_column:
+        return []
 
+    result = (
+        supabase
+        .table("users")
+        .select("""
+            user_id,
+            name,
+            email,
+            city,
+            user_preferences!inner(
+                offers,
+                order_updates,
+                newsletter
+            )
+        """)
+        .eq("city", city)
+        .eq("is_active", True)
+        .eq(f"user_preferences.{preference_column}", True)
+        .execute()
+    )
+
+    return result.data
+
+@app.post("/campaigns/{campaign_id}/send")
+def send_campaign(campaign_id: str):
+    recipients = get_campaign_recipients(UUID(campaign_id))
+
+    if not recipients:
+        return {"sent_to": 0, "status": "no_recipients"}
+
+    logs = [
+        {
+            "log_id": str(uuid.uuid4()),
+            "campaign_id": campaign_id,
+            "user_id": u["user_id"],
+            "status": "success",
+            "sent_at": datetime.utcnow().isoformat(),
+        }
+        for u in recipients
+    ]
+
+    supabase.table("campaign_logs").insert(logs).execute()
+
+    supabase.table("campaigns").update({
+        "status": "sent",
+        "sent_at": datetime.utcnow().isoformat(),
+    }).eq("campaign_id", campaign_id).execute()
+
+    return {"sent_to": len(logs), "status": "sent"}
+
+# ---------------- USERS ----------------
 def build_default_password(name: str, phone: str) -> str:
     return f"{name.lower().replace(' ', '')}{phone}"
-
-class CreateUserRequest(BaseModel):
-    name: str
-    email: str
-    phone: str
-    city: str
-    gender: str | None = None
 
 @app.post("/admin/users")
 def create_user(payload: CreateUserRequest):
     user_id = str(uuid.uuid4())
     password = build_default_password(payload.name, payload.phone)
 
-    user = {
+    supabase.table("users").insert({
         "user_id": user_id,
         "name": payload.name,
         "email": payload.email,
@@ -165,14 +233,9 @@ def create_user(payload: CreateUserRequest):
         "password": password,
         "is_active": True,
         "created_at": datetime.utcnow().isoformat(),
-    }
+    }).execute()
 
-    user_res = supabase.table("users").insert(user).execute()
-
-    if not user_res.data:
-        raise HTTPException(status_code=500, detail="User creation failed")
-
-    pref = {
+    supabase.table("user_preferences").insert({
         "user_id": user_id,
         "offers": True,
         "order_updates": True,
@@ -181,11 +244,9 @@ def create_user(payload: CreateUserRequest):
         "sms_channel": False,
         "push_channel": False,
         "updated_at": datetime.utcnow().isoformat(),
-    }
+    }).execute()
 
-    supabase.table("user_preferences").insert(pref).execute()
-
-    return user_res.data[0]
+    return {"user_id": user_id}
 
 @app.get("/admin/users")
 def get_users():
@@ -197,13 +258,6 @@ def get_users():
         .execute()
     )
     return res.data or []
-
-class UpdateUserRequest(BaseModel):
-    name: str
-    email: str
-    phone: str
-    city: str
-    gender: str | None = None
 
 @app.put("/admin/users/{user_id}")
 def update_user(user_id: str, payload: UpdateUserRequest):
@@ -234,6 +288,20 @@ def toggle_user(user_id: str):
     }).eq("user_id", user_id).execute()
 
     return {"is_active": new_value}
+
+@app.get("/users/{user_id}/preferences")
+def get_user_preferences(user_id: str):
+    res = (
+        supabase
+        .table("user_preferences")
+        .select("*")
+        .eq("user_id", user_id)
+        .single()
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Preferences not found")
+    return res.data
 
 @app.post("/admin/users/upload-csv")
 def upload_users_csv(file: UploadFile = File(...)):
