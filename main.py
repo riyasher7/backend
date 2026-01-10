@@ -126,3 +126,31 @@ def update_user_preferences(user_id: str, payload: PreferenceUpdate):
         "status": "success",
         "preferences": res.data[0]
     }
+
+class EmployeeLoginRequest(BaseModel):
+    email: str
+    password: str
+
+@app.post("/auth/employee/login")
+def employee_login(payload: EmployeeLoginRequest):
+    res = (
+        supabase
+        .table("employees")
+        .select("employee_id, email, password, role_id")
+        .eq("email", payload.email)
+        .execute()
+    )
+
+    if not res.data:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    employee = res.data[0]
+
+    if employee["password"] != payload.password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    return {
+        "employee_id": employee["employee_id"],
+        "email": employee["email"],
+        "role_id": employee["role_id"],  # ✅ THIS is critical
+    }
