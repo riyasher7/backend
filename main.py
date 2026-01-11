@@ -303,6 +303,32 @@ def get_user_preferences(user_id: str):
         raise HTTPException(status_code=404, detail="Preferences not found")
     return res.data
 
+class UserPreferencesUpdate(BaseModel):
+    offers: bool
+    push_channel: bool
+    email_channel: bool
+    sms_channel: bool
+    order_updates: bool
+    newsletter: bool
+
+@app.put("/users/{user_id}/preferences")
+def update_user_preferences(
+    user_id: UUID,
+    prefs: UserPreferencesUpdate
+):
+    result = (
+        supabase
+        .table("user_preferences")
+        .update(prefs.model_dump())  # pydantic v2
+        .eq("user_id", str(user_id))
+        .execute()
+    )
+
+    return {
+        "message": "Preferences updated successfully",
+        "data": result.data
+    }
+
 @app.post("/admin/users/upload-csv")
 def upload_users_csv(file: UploadFile = File(...)):
     rows = file.file.read().decode("utf-8").splitlines()
