@@ -139,8 +139,7 @@ def create_campaign(payload: CampaignCreate):
     )
     return res.data[0]
 
-@app.get("/campaigns/{campaign_id}/recipients")
-def get_campaign_recipients(campaign_id: UUID):
+def get_eligible_users_for_campaign(campaign_id: UUID):
     campaign = (
         supabase.table("campaigns")
         .select("*")
@@ -151,7 +150,7 @@ def get_campaign_recipients(campaign_id: UUID):
     )
 
     if not campaign:
-        return {"recipients": []}
+        return []
 
     users = (
         supabase.table("users")
@@ -170,133 +169,67 @@ def get_campaign_recipients(campaign_id: UUID):
     pref_key = pref_key_map.get(campaign["notification_type"])
 
     eligible = []
+
     for user in users:
         prefs = user.get("user_preferences")
         if not prefs:
             continue
-        if prefs.get(pref_key) is True:
-            if campaign["city_filter"] and user["city"].lower() != campaign["city_filter"].lower():
+
+        if prefs.get(pref_key) is not True:
+            continue
+
+        if campaign["city_filter"]:
+            if not user["city"] or user["city"].lower() != campaign["city_filter"].lower():
                 continue
-            eligible.append({
-                "user_id": user["user_id"],
-                "name": user["name"],
-                "email": user["email"],
-                "city": user["city"],
-            })
 
-    return {"recipients": eligible}
+        eligible.append({
+            "user_id": user["user_id"],
+            "name": user["name"],
+            "email": user["email"],
+            "city": user["city"],
+        })
+
+    return eligible
 
 
-'''@app.post("/campaigns/{campaign_id}/send")
-def send_campaign(campaign_id: str):
-    recipients = get_campaign_recipients(UUID(campaign_id))
+@app.get("/campaigns/{campaign_id}/recipients")
+def get_campaign_recipients(campaign_id: UUID):
+    recipients = get_eligible_users_for_campaign(campaign_id)
+    return {"recipients": recipients}
+
+@app.post("/campaigns/{campaign_id}/send")
+def send_campaign(campaign_id: UUID):
+    recipients = get_eligible_users_for_campaign(campaign_id)
 
     if not recipients:
-        return {"sent_to": 0, "status": "no_recipients"}
+        return {
+            "status": "sent",
+            "sent_to": 0
+        }
+
+    now = datetime.utcnow().isoformat()
 
     logs = [
         {
-            "log_id": str(uuid.uuid4()),
-            "campaign_id": campaign_id,
-            "user_id": u["user_id"],
+            "campaign_id": str(campaign_id),
+            "user_id": user["user_id"],
             "status": "success",
-            "sent_at": datetime.utcnow().isoformat(),
+            "sent_at": now,
         }
-        for u in recipients
+        for user in recipients
     ]
 
     supabase.table("campaign_logs").insert(logs).execute()
 
     supabase.table("campaigns").update({
-        "status": "sent",
-        "sent_at": datetime.utcnow().isoformat(),
-    }).eq("campaign_id", campaign_id).execute()
-
-    return {"sent_to": len(logs), "status": "sent"}'''
-
-
-@app.post("/campaigns/{campaign_id}/send")
-def send_campaign(campaign_id: UUID):
-    # 1. Get campaign
-    campaign_res = (
-        supabase
-        .table("campaigns")
-        .select("*")
-        .eq("campaign_id", str(campaign_id))
-        .single()
-        .execute()
-    )
-
-    if not campaign_res.data:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-
-    campaign = campaign_res.data
-
-    # 2. Build user query
-    user_query = (
-        supabase
-        .table("users")
-        .select("user_id, city")
-        .eq("is_active", True)
-    )
-
-    if campaign["city_filter"]:
-        user_query = user_query.eq("city", campaign["city_filter"])
-
-    users_res = user_query.execute()
-    users = users_res.data or []
-
-    if not users:
-        return {"message": "No eligible users found", "sent": 0}
-
-    # 3. Filter by user preferences
-    eligible_users = []
-
-    for user in users:
-        pref = (
-            supabase
-            .table("user_preferences")
-            .select("*")
-            .eq("user_id", user["user_id"])
-            .single()
-            .execute()
-        )
-
-        if not pref.data:
-            continue
-
-        notif_type = campaign["notification_type"]
-
-        if notif_type == "offers" and pref.data["offers"]:
-            eligible_users.append(user)
-        elif notif_type == "order_updates" and pref.data["order_updates"]:
-            eligible_users.append(user)
-        elif notif_type == "newsletter" and pref.data["newsletter"]:
-            eligible_users.append(user)
-
-    # 4. Insert campaign logs
-    logs = [
-        {
-            "campaign_id": str(campaign_id),
-            "user_id": user["user_id"],
-            "sent_at": datetime.utcnow().isoformat(),
-            "status": "sent"
-        }
-        for user in eligible_users
-    ]
-
-    if logs:
-        supabase.table("campaign_logs").insert(logs).execute()
-
-    # 5. Update campaign status
-    supabase.table("campaigns").update(
-        {"status": "sent"}
-    ).eq("campaign_id", str(campaign_id)).execute()
+        "status": "sent"
+    }).eq("campaign_id", str(campaign_id)).execute()
 
     return {
-        "message": "Campaign sent successfully",
-        "sent_to": len(logs)
+        "status": "sent",
+        "sent_to": len(recipients)
     }
+
 
 # ---------------- USERS ----------------
 def build_default_password(name: str, phone: str) -> str:
