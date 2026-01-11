@@ -124,20 +124,45 @@ def list_campaigns():
 
 @app.post("/campaigns")
 def create_campaign(payload: CampaignCreate):
+    notification_type_map = {
+        "promotional_offers": "offers",
+        "offers": "offers",
+
+        "order_updates": "order_updates",
+
+        "newsletter": "newsletter",
+        "newsletters": "newsletter",
+    }
+
+    input_type = payload.notification_type.strip().lower()
+    db_notification_type = notification_type_map.get(input_type)
+
+    if not db_notification_type:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid notification type: {payload.notification_type}"
+        )
+
     res = (
         supabase
         .table("campaigns")
         .insert({
             "campaign_name": payload.campaign_name,
-            "notification_type": payload.notification_type,
+            "notification_type": db_notification_type,  # ✅ enum-safe
             "city_filter": payload.city_filter,
             "content": payload.content,
             "created_by": payload.created_by,
             "status": "draft",
+            "created_at": datetime.utcnow().isoformat(),
         })
         .execute()
     )
+
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Failed to create campaign")
+
     return res.data[0]
+
 
 def get_eligible_users_for_campaign(campaign_id: UUID):
     campaign = (
