@@ -305,25 +305,32 @@ def get_user_preferences(user_id: str):
 
 @app.post("/admin/users/upload-csv")
 def upload_users_csv(file: UploadFile = File(...)):
-    rows = file.file.read().decode("utf-8").splitlines()
-    reader = csv.DictReader(rows)
+    try:
+        content = file.file.read().decode("utf-8").splitlines()
+        reader = csv.DictReader(content)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid CSV file")
 
     users = []
     prefs = []
 
     for row in reader:
+        if not row.get("name") or not row.get("email") or not row.get("phone"):
+            continue
+
         user_id = str(uuid.uuid4())
         password = build_default_password(row["name"], row["phone"])
 
         users.append({
             "user_id": user_id,
-            "name": row["name"],
-            "email": row["email"],
-            "phone": row["phone"],
+            "name": row["name"].strip(),
+            "email": row["email"].strip(),
+            "phone": row["phone"].strip(),
             "city": row["city"],
             "gender": row.get("gender"),
             "password": password,
             "is_active": True,
+            "created_at": datetime.utcnow().isoformat(),
         })
 
         prefs.append({
@@ -337,7 +344,18 @@ def upload_users_csv(file: UploadFile = File(...)):
             "updated_at": datetime.utcnow().isoformat(),
         })
 
-    supabase.table("users").insert(users).execute()
-    supabase.table("user_preferences").insert(prefs).execute()
+    if not users:
+        raise HTTPException(status_code=400, detail="No valid users found in CSV")
+    
+    user_res = supabase.table("users").insert(users).execute()
+    if not user_res.data:
+        raise HTTPException(status_code=500, detail="Failed to insert users")
+    
+    pref_res = supabase.table("user_preferences").insert(prefs).execute()
+    if not pref_res.data:
+        raise HTTPException(status_code=500, detail="Failed to insert preferences")
 
-    return {"created": len(users)}
+    return {
+        "status": "success",
+        "created": len(users)
+    }
