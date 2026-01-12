@@ -221,7 +221,7 @@ def get_eligible_users_for_campaign(campaign_id: UUID):
     pref_key_map = {
         "offers": "offers",
         "order_updates": "order_updates",
-        "newsletters": "newsletter",
+        "newsletter": "newsletter",
     }
 
     pref_key = pref_key_map.get(campaign["notification_type"])
