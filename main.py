@@ -39,6 +39,12 @@ class CampaignCreate(BaseModel):
     content: str
     created_by: UUID
 
+class NewsletterCreate(BaseModel):
+    news_name: str
+    city_filter: Optional[str] = None
+    content: str
+    created_by: UUID
+
 class EmployeeCreate(BaseModel):
     email: str
     password: str
@@ -177,8 +183,6 @@ def create_campaign(payload: CampaignCreate):
 
     return res.data[0]
 
-
-'''
 def get_eligible_users_for_campaign(campaign_id: UUID):
     campaign = (
         supabase.table("campaigns")
@@ -253,6 +257,7 @@ def send_campaign(campaign_id: UUID):
         {
             "campaign_id": str(campaign_id),
             "user_id": user["user_id"],
+            "notification_type": "offers",
             "status": "success",
             "sent_at": now,
         }
@@ -270,6 +275,123 @@ def send_campaign(campaign_id: UUID):
         "sent_to": len(recipients)
     }
 
+@app.get("/newsletters")
+def list_newsletters():
+    return (
+        supabase
+        .table("newsletters")
+        .select("*")
+        .order("created_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
+
+@app.post("/newsletters")
+def create_newsletter(payload: NewsletterCreate):
+    res = (
+        supabase
+        .table("newsletters")
+        .insert({
+            "news_name": payload.news_name,
+            #"notification_type": "promotional_offers",
+            "city_filter": payload.city_filter,
+            "content": payload.content,
+            "created_by": str(payload.created_by),
+            "status": "DRAFT",
+            "created_at": datetime.utcnow().isoformat(),
+        })
+        .execute()
+    )
+
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Failed to create campaign")
+
+    return res.data[0]
+
+def get_eligible_users_for_newsletter(newsletter_id: UUID):
+    campaign = (
+        supabase.table("newsletters")
+        .select("*")
+        .eq("newsletter_id", str(newsletter_id))
+        .single()
+        .execute()
+        .data
+    )
+
+    if not campaign:
+        return []
+
+    users = (
+        supabase.table("users")
+        .select("user_id, name, email, city, user_preferences(*)")
+        .eq("is_active", True)
+        .execute()
+        .data
+    )
+
+    eligible = []
+
+    for user in users:
+        prefs = user.get("user_preferences")
+        if not prefs:
+            continue
+
+        if prefs.get(pref_key) is not True:
+            continue
+
+        if campaign["city_filter"]:
+            if not user["city"] or user["city"].lower() != campaign["city_filter"].lower():
+                continue
+
+        eligible.append({
+            "user_id": user["user_id"],
+            "name": user["name"],
+            "email": user["email"],
+            "city": user["city"],
+        })
+
+    return eligible
+
+
+@app.get("/newsletters/{newsletter_id}/recipients")
+def get_campaign_recipients(newsletter_id: UUID):
+    recipients = get_eligible_users_for_newsletter(newsletter_id)
+    return {"recipients": recipients}
+
+@app.post("/newsletters/{newsletter_id}/send")
+def send_campaign(newsletter_id: UUID):
+    recipients = get_eligible_users_for_newsletter(newsletter_id)
+
+    if not recipients:
+        return {
+            "status": "SENT",
+            "sent_to": 0
+        }
+
+    now = datetime.utcnow().isoformat()
+
+    logs = [
+        {
+            "log_id": str(newsletter_id),
+            "user_id": user["user_id"],
+            "notification_type": "newsletter",
+            "status": "success",
+            "sent_at": now,
+        }
+        for user in recipients
+    ]
+
+    supabase.table("notification_logs").insert(logs).execute()
+
+    supabase.table("newsletters").update({
+        "status": "SENT"
+    }).eq("newsletter_id", str(newsletter_id)).execute()
+
+    return {
+        "status": "SENT",
+        "sent_to": len(recipients)
+    }
 
 # ---------------- USERS ----------------
 def build_default_password(name: str, phone: str) -> str:
@@ -442,4 +564,3 @@ def upload_users_csv(file: UploadFile = File(...)):
         "status": "success",
         "created": len(users)
     }
-'''
