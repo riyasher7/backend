@@ -286,7 +286,7 @@ def create_newsletter(payload: NewsletterCreate):
     return res.data[0]
 
 def get_eligible_users_for_newsletter(newsletter_id: UUID):
-    campaign = (
+    newsletter = (
         supabase.table("newsletters")
         .select("*")
         .eq("newsletter_id", str(newsletter_id))
@@ -295,18 +295,20 @@ def get_eligible_users_for_newsletter(newsletter_id: UUID):
         .data
     )
 
-    if not campaign:
+    if not newsletter:
         return []
 
     users = (
         supabase.table("users")
         .select("user_id, name, email, city, user_preferences(*)")
         .eq("is_active", True)
+        .eq("role_id", 4)
         .execute()
         .data
     )
 
     eligible = []
+    pref_key = "newsletter"
 
     for user in users:
         prefs = user.get("user_preferences")
@@ -316,8 +318,8 @@ def get_eligible_users_for_newsletter(newsletter_id: UUID):
         if prefs.get(pref_key) is not True:
             continue
 
-        if campaign["city_filter"]:
-            if not user["city"] or user["city"].lower() != campaign["city_filter"].lower():
+        if newsletter["city_filter"]:
+            if not user["city"] or user["city"].lower() != newsletter["city_filter"].lower():
                 continue
 
         eligible.append({
@@ -331,12 +333,12 @@ def get_eligible_users_for_newsletter(newsletter_id: UUID):
 
 
 @app.get("/newsletters/{newsletter_id}/recipients")
-def get_campaign_recipients(newsletter_id: UUID):
+def get_newsletter_recipients(newsletter_id: UUID):
     recipients = get_eligible_users_for_newsletter(newsletter_id)
     return {"recipients": recipients}
 
 @app.post("/newsletters/{newsletter_id}/send")
-def send_campaign(newsletter_id: UUID):
+def send_newsletter(newsletter_id: UUID):
     recipients = get_eligible_users_for_newsletter(newsletter_id)
 
     if not recipients:
@@ -351,8 +353,8 @@ def send_campaign(newsletter_id: UUID):
         {
             "log_id": str(newsletter_id),
             "user_id": user["user_id"],
-            "notification_type": "newsletter",
-            "status": "success",
+            "notification_type": "NEWSLETTER",
+            "status": "SUCCESS",
             "sent_at": now,
         }
         for user in recipients
