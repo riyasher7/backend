@@ -231,23 +231,23 @@ def send_campaign(campaign_id: UUID):
 
     logs = [
         {
-            "campaign_id": str(campaign_id),
+            "log_id": str(campaign_id),
             "user_id": user["user_id"],
-            "notification_type": "offers",
-            "status": "success",
+            "notification_type": "CAMPAIGN",
+            "status": "SUCCESS",
             "sent_at": now,
         }
         for user in recipients
     ]
 
-    supabase.table("campaign_logs").insert(logs).execute()
+    supabase.table("notification_logs").insert(logs).execute()
 
     supabase.table("campaigns").update({
-        "status": "sent"
+        "status": "SENT"
     }).eq("campaign_id", str(campaign_id)).execute()
 
     return {
-        "status": "sent",
+        "status": "SENT",
         "sent_to": len(recipients)
     }
 
@@ -306,6 +306,7 @@ def get_eligible_users_for_newsletter(newsletter_id: UUID):
         .data
     )
 
+    pref_key = "newsletters"
     eligible = []
 
     for user in users:
@@ -351,8 +352,8 @@ def send_campaign(newsletter_id: UUID):
         {
             "log_id": str(newsletter_id),
             "user_id": user["user_id"],
-            "notification_type": "newsletter",
-            "status": "success",
+            "notification_type": "NEWSLETTER",
+            "status": "SUCCESS",
             "sent_at": now,
         }
         for user in recipients
