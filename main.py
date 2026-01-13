@@ -35,10 +35,9 @@ class EmployeeLoginRequest(BaseModel):
 
 class CampaignCreate(BaseModel):
     campaign_name: str
-    notification_type: str
     city_filter: Optional[str] = None
     content: str
-    created_by: int
+    created_by: UUID
 
 class EmployeeCreate(BaseModel):
     email: str
@@ -91,6 +90,7 @@ def user_login(payload: LoginRequest):
         "user_id": user["user_id"],
         "email": user["email"],
         "name": user["name"],
+        "role_id": user["role_id"],
     }
 
 @app.post("/auth/employee/login")
@@ -157,35 +157,16 @@ def list_campaigns():
 
 @app.post("/campaigns")
 def create_campaign(payload: CampaignCreate):
-    notification_type_map = {
-        "promotional_offers": "offers",
-        "offers": "offers",
-
-        "order_updates": "order_updates",
-
-        "newsletter": "newsletter",
-        "newsletters": "newsletter",
-    }
-
-    input_type = payload.notification_type.strip().lower()
-    db_notification_type = notification_type_map.get(input_type)
-
-    if not db_notification_type:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid notification type: {payload.notification_type}"
-        )
-
     res = (
         supabase
         .table("campaigns")
         .insert({
             "campaign_name": payload.campaign_name,
-            "notification_type": db_notification_type,  # ✅ enum-safe
+            #"notification_type": "promotional_offers",
             "city_filter": payload.city_filter,
             "content": payload.content,
-            "created_by": payload.created_by,
-            "status": "draft",
+            "created_by": str(payload.created_by),
+            "status": "DRAFT",
             "created_at": datetime.utcnow().isoformat(),
         })
         .execute()
@@ -197,6 +178,7 @@ def create_campaign(payload: CampaignCreate):
     return res.data[0]
 
 
+'''
 def get_eligible_users_for_campaign(campaign_id: UUID):
     campaign = (
         supabase.table("campaigns")
@@ -460,3 +442,4 @@ def upload_users_csv(file: UploadFile = File(...)):
         "status": "success",
         "created": len(users)
     }
+'''
