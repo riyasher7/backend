@@ -99,35 +99,17 @@ def user_login(payload: LoginRequest):
         "role_id": user["role_id"],
     }
 
-@app.post("/auth/employee/login")
-def employee_login(payload: EmployeeLoginRequest):
-    res = (
-        supabase
-        .table("employees")
-        .select("employee_id, email, password, role_id")
-        .eq("email", payload.email)
-        .execute()
-    )
-
-    if not res.data:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    employee = res.data[0]
-
-    if employee["password"] != payload.password:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    return employee
-
 @app.get("/admin/employeesmgmt")
 def list_employees(_: dict = Depends(admin_only)):
     res = (
-        supabase.table("employees")
-        .select("employee_id, email, role_id")
+        supabase.table("users")
+        .select("user_id, name, email, role_id")
+        .in_("role_id", [1, 2, 3])  
         .order("email")
         .execute()
     )
     return res.data or []
+
 
 @app.post("/admin/employeesmgmt")
 def create_employee(data: EmployeeCreate, _: dict = Depends(admin_only)):
@@ -140,11 +122,11 @@ def create_employee(data: EmployeeCreate, _: dict = Depends(admin_only)):
 
 @app.delete("/admin/employeesmgmt/{employee_id}")
 def delete_employee(employee_id: int, user=Depends(admin_only)):
-    if employee_id == user["employee_id"]:
+    if employee_id == user["user_id"]:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
 
-    supabase.table("employees").delete().eq(
-        "employee_id", employee_id
+    supabase.table("users").delete().eq(
+        "user_id", employee_id
     ).execute()
 
     return {"success": True}
