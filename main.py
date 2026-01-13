@@ -178,7 +178,6 @@ def create_campaign(payload: CampaignCreate):
     return res.data[0]
 
 
-'''
 def get_eligible_users_for_campaign(campaign_id: UUID):
     campaign = (
         supabase.table("campaigns")
@@ -200,13 +199,7 @@ def get_eligible_users_for_campaign(campaign_id: UUID):
         .data
     )
 
-    pref_key_map = {
-        "offers": "offers",
-        "order_updates": "order_updates",
-        "newsletter": "newsletter",
-    }
-
-    pref_key = pref_key_map.get(campaign["notification_type"])
+    pref_key = "offers"
 
     eligible = []
 
@@ -290,6 +283,7 @@ def create_user(payload: CreateUserRequest):
         "password": password,
         "is_active": True,
         "created_at": datetime.utcnow().isoformat(),
+        "role_id": 4,
     }).execute()
 
     supabase.table("user_preferences").insert({
@@ -297,10 +291,13 @@ def create_user(payload: CreateUserRequest):
         "offers": True,
         "order_updates": True,
         "newsletter": True,
-        "email_channel": True,
-        "sms_channel": False,
-        "push_channel": False,
-        "updated_at": datetime.utcnow().isoformat(),
+    }).execute()
+
+    supabase.table("notification_type").insert({
+        "user_id": user_id,
+        "email": True,
+        "sms": True,
+        "push": True,
     }).execute()
 
     return {"user_id": user_id}
@@ -311,6 +308,7 @@ def get_users():
         supabase
         .table("users")
         .select("*")
+        .eq("role_id", 4)
         .order("created_at", desc=True)
         .execute()
     )
@@ -396,6 +394,7 @@ def upload_users_csv(file: UploadFile = File(...)):
 
     users = []
     prefs = []
+    type = []
 
     for row in reader:
         if not row.get("name") or not row.get("email") or not row.get("phone"):
@@ -414,6 +413,7 @@ def upload_users_csv(file: UploadFile = File(...)):
             "password": password,
             "is_active": True,
             "created_at": datetime.utcnow().isoformat(),
+            "role_id": 4,
         })
 
         prefs.append({
@@ -421,11 +421,15 @@ def upload_users_csv(file: UploadFile = File(...)):
             "offers": True,
             "order_updates": True,
             "newsletter": True,
-            "email_channel": True,
-            "sms_channel": False,
-            "push_channel": False,
-            "updated_at": datetime.utcnow().isoformat(),
         })
+
+        type.append({
+            "user_id": user_id,
+            "email": True,
+            "sms": True,
+            "push": True,
+        })
+    
 
     if not users:
         raise HTTPException(status_code=400, detail="No valid users found in CSV")
@@ -437,9 +441,12 @@ def upload_users_csv(file: UploadFile = File(...)):
     pref_res = supabase.table("user_preferences").insert(prefs).execute()
     if not pref_res.data:
         raise HTTPException(status_code=500, detail="Failed to insert preferences")
+    
+    type_res = supabase.table("notification_type").insert(type).execute()
+    if not type_res.data:
+        raise HTTPException(status_code=500, detail="Failed to insert notification types")
 
     return {
         "status": "success",
         "created": len(users)
     }
-'''
