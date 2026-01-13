@@ -46,6 +46,7 @@ class NewsletterCreate(BaseModel):
     created_by: UUID
 
 class EmployeeCreate(BaseModel):
+    name: str
     email: str
     password: str
     role_id: int
@@ -113,10 +114,12 @@ def list_employees(_: dict = Depends(admin_only)):
 
 @app.post("/admin/employeesmgmt")
 def create_employee(data: EmployeeCreate, _: dict = Depends(admin_only)):
-    supabase.table("employees").insert({
+    supabase.table("users").insert({
+        "name": data.name,
         "email": data.email,
         "password": data.password,
-        "role_id": data.role_id
+        "role_id": data.role_id,
+        "created_at": datetime.utcnow().isoformat(),
     }).execute()
     return {"success": True}
 
