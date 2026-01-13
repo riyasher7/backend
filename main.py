@@ -471,9 +471,6 @@ def get_user_preferences(user_id: str):
 
 class UserPreferencesUpdate(BaseModel):
     offers: bool
-    push_channel: bool
-    email_channel: bool
-    sms_channel: bool
     order_updates: bool
     newsletter: bool
 
@@ -482,18 +479,51 @@ def update_user_preferences(
     user_id: UUID,
     prefs: UserPreferencesUpdate
 ):
-    result = (
+    res = (
         supabase
         .table("user_preferences")
-        .update(prefs.model_dump())  # pydantic v2
+        .update(prefs.model_dump())
         .eq("user_id", str(user_id))
         .execute()
     )
 
-    return {
-        "message": "Preferences updated successfully",
-        "data": result.data
-    }
+    return {"success": True, "data": res.data}
+
+class NotificationChannelUpdate(BaseModel):
+    email: bool
+    sms: bool
+    push: bool
+
+@app.put("/users/{user_id}/channels")
+def update_notification_channels(
+    user_id: UUID,
+    channels: NotificationChannelUpdate
+):
+    res = (
+        supabase
+        .table("notification_type")
+        .update(channels.model_dump())
+        .eq("user_id", str(user_id))
+        .execute()
+    )
+
+    return {"success": True, "data": res.data}
+
+@app.get("/users/{user_id}/channels")
+def get_notification_channels(user_id: UUID):
+    res = (
+        supabase
+        .table("notification_type")
+        .select("*")
+        .eq("user_id", str(user_id))
+        .single()
+        .execute()
+    )
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Channels not found")
+
+    return res.data
 
 @app.post("/admin/users/upload-csv")
 def upload_users_csv(file: UploadFile = File(...)):
@@ -561,3 +591,68 @@ def upload_users_csv(file: UploadFile = File(...)):
         "status": "success",
         "created": len(users)
     }
+
+class CreateOrderRequest(BaseModel):
+    order_name: str
+
+@app.post("/users/{user_id}/orders")
+def create_order(user_id: UUID, payload: CreateOrderRequest):
+    order_id = str(uuid.uuid4())
+
+    res = (
+        supabase
+        .table("orders")
+        .insert({
+            "order_id": order_id,
+            "user_id": str(user_id),
+            "order_name": payload.order_name,  # ✅ dynamic
+            "status": "PLACED",
+        })
+        .execute()
+    )
+
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Failed to create order")
+
+    return res.data[0]
+
+@app.get("/admin/orders")
+def admin_orders():
+    res = (
+        supabase
+        .table("orders")
+        .select("*")
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return res.data or []
+
+
+@app.get("/users/{user_id}/orders")
+def get_user_orders(user_id: UUID):
+    res = (
+        supabase
+        .table("orders")
+        .select("*")
+        .eq("user_id", str(user_id))
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return res.data or []
+
+@app.post("/users/{user_id}/orders/{order_id}/request-update")
+def request_order_update(user_id: UUID, order_id: UUID):
+    supabase.table("orders").update({
+        "status": "UPDATE_REQUESTED"
+    }).eq("order_id", str(order_id)).eq("user_id", str(user_id)).execute()
+
+    return {"message": "Update requested"}
+
+@app.post("/admin/orders/{order_id}/send-update")
+def send_order_update(order_id: UUID):
+    supabase.table("orders").update({
+        "status": "SENT"
+    }).eq("order_id", str(order_id)).execute()
+
+    return {"message": "Order update sent"}
+
