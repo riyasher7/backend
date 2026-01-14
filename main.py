@@ -1,18 +1,21 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile, Depends
+from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from datetime import datetime
+from datetime import datetime, timedelta
 from supabase_client import supabase
 from typing import Optional
 from uuid import UUID
 import uuid
 import csv
+import secrets
+import bcrypt
 from ws import router as ws_router
 from websocket_manager import manager
 
 app = FastAPI()
 
 app.include_router(ws_router)
+
 # ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
@@ -27,6 +30,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------- SESSION STORAGE ----------------
+# In production, use Redis or a database for session storage
+active_sessions = {}
 
 # ---------------- MODELS ----------------
 class LoginRequest(BaseModel):
@@ -77,10 +84,62 @@ class SignUp(BaseModel):
     city: str
     phone: str
 
+# ---------------- AUTHENTICATION HELPERS ----------------
+def hash_password(password: str) -> str:
+    """Hash a password using bcrypt"""
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+    return hashed.decode('utf-8')
 
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a password against its hash"""
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
-def admin_only():
-    return {"employee_id" : 1, "role" : "admin"}
+def create_session_token() -> str:
+    """Generate a secure random session token"""
+    return secrets.token_urlsafe(32)
+
+def create_session(user_id: str, role_id: int, email: str) -> str:
+    """Create a new session and return the token"""
+    token = create_session_token()
+    active_sessions[token] = {
+        "user_id": user_id,
+        "role_id": role_id,
+        "email": email,
+        "created_at": datetime.utcnow(),
+        "expires_at": datetime.utcnow() + timedelta(days=7)  # 7 day expiry
+    }
+    return token
+
+def get_current_user(authorization: Optional[str] = Header(None)):
+    """Dependency to get current authenticated user"""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    # Extract token (supports both "Bearer TOKEN" and just "TOKEN")
+    token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+    
+    session = active_sessions.get(token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    
+    # Check if session has expired
+    if datetime.utcnow() > session["expires_at"]:
+        del active_sessions[token]
+        raise HTTPException(status_code=401, detail="Session expired")
+    
+    return session
+
+def admin_only(authorization: Optional[str] = Header(None)):
+    """Dependency to ensure user is an admin"""
+    user = get_current_user(authorization)
+    if user["role_id"] != 1:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+def build_default_password(name: str, phone: str) -> str:
+    return f"{name.lower().replace(' ', '')}{phone}"
+
 # ---------------- ROOT ----------------
 @app.get("/")
 def root():
@@ -102,14 +161,19 @@ def user_login(payload: LoginRequest):
 
     user = res.data[0]
 
-    if user["password"] != payload.password:
+    # Verify password hash
+    if not verify_password(payload.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Create session
+    token = create_session(user["user_id"], user["role_id"], user["email"])
 
     return {
         "user_id": user["user_id"],
         "email": user["email"],
         "name": user["name"],
         "role_id": user["role_id"],
+        "session_token": token
     }
 
 @app.post("/auth/user/signup")
@@ -123,12 +187,15 @@ def user_signup(payload: SignUp):
     )
     if existing.data:
         raise HTTPException(status_code=400, detail="Email already registered")
+    
     user_id = str(uuid.uuid4())
+    hashed_password = hash_password(payload.password)
+
     supabase.table("users").insert({
         "user_id": user_id,
         "name": payload.name,
         "email": payload.email,
-        "password": payload.password,
+        "password": hashed_password,
         "phone": payload.phone,
         "is_active": True,
         "created_at": datetime.utcnow().isoformat(),
@@ -148,10 +215,40 @@ def user_signup(payload: SignUp):
         "user_id": user_id
     }).execute()
 
-    return {"user_id": user_id, "email": payload.email, "name": payload.name}
+    # Create session for new user
+    token = create_session(user_id, 4, payload.email)
+
+    return {
+        "user_id": user_id,
+        "email": payload.email,
+        "name": payload.name,
+        "session_token": token
+    }
+
+@app.post("/auth/logout")
+def logout(authorization: Optional[str] = Header(None)):
+    """Logout and invalidate session"""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+    
+    if token in active_sessions:
+        del active_sessions[token]
+    
+    return {"message": "Logged out successfully"}
+
+@app.get("/auth/me")
+def get_current_user_info(user: dict = Depends(get_current_user)):
+    """Get current authenticated user information"""
+    return {
+        "user_id": user["user_id"],
+        "email": user["email"],
+        "role_id": user["role_id"]
+    }
 
 @app.get("/admin/employeesmgmt")
-def list_employees(_: dict = Depends(admin_only)):
+def list_employees(user: dict = Depends(admin_only)):
     res = (
         supabase.table("users")
         .select("user_id, name, email, role_id")
@@ -161,20 +258,21 @@ def list_employees(_: dict = Depends(admin_only)):
     )
     return res.data or []
 
-
 @app.post("/admin/employeesmgmt")
-def create_employee(data: EmployeeCreate, _: dict = Depends(admin_only)):
+def create_employee(data: EmployeeCreate, user: dict = Depends(admin_only)):
+    hashed_password = hash_password(data.password)
+    
     supabase.table("users").insert({
         "name": data.name,
         "email": data.email,
-        "password": data.password,
+        "password": hashed_password,
         "role_id": data.role_id,
         "created_at": datetime.utcnow().isoformat(),
     }).execute()
     return {"success": True}
 
 @app.delete("/admin/employeesmgmt/{employee_id}")
-def delete_employee(employee_id: int, user=Depends(admin_only)):
+def delete_employee(employee_id: int, user: dict = Depends(admin_only)):
     if employee_id == user["user_id"]:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
 
@@ -183,9 +281,10 @@ def delete_employee(employee_id: int, user=Depends(admin_only)):
     ).execute()
 
     return {"success": True}
+
 # ---------------- CAMPAIGNS ----------------
 @app.get("/campaigns")
-def list_campaigns():
+def list_campaigns(user: dict = Depends(get_current_user)):
     return (
         supabase
         .table("campaigns")
@@ -197,13 +296,12 @@ def list_campaigns():
     )
 
 @app.post("/campaigns")
-def create_campaign(payload: CampaignCreate):
+def create_campaign(payload: CampaignCreate, user: dict = Depends(get_current_user)):
     res = (
         supabase
         .table("campaigns")
         .insert({
             "campaign_name": payload.campaign_name,
-            #"notification_type": "promotional_offers",
             "city_filter": payload.city_filter,
             "content": payload.content,
             "created_by": str(payload.created_by),
@@ -241,7 +339,6 @@ def get_eligible_users_for_campaign(campaign_id: UUID):
     )
 
     pref_key = "offers"
-
     eligible = []
 
     for user in users:
@@ -265,14 +362,13 @@ def get_eligible_users_for_campaign(campaign_id: UUID):
 
     return eligible
 
-
 @app.get("/campaigns/{campaign_id}/recipients")
-def get_campaign_recipients(campaign_id: UUID):
+def get_campaign_recipients(campaign_id: UUID, user: dict = Depends(get_current_user)):
     recipients = get_eligible_users_for_campaign(campaign_id)
     return {"recipients": recipients}
 
 @app.post("/campaigns/{campaign_id}/send")
-async def send_campaign(campaign_id: UUID):
+async def send_campaign(campaign_id: UUID, user: dict = Depends(get_current_user)):
     recipients = get_eligible_users_for_campaign(campaign_id)
 
     if not recipients:
@@ -280,7 +376,6 @@ async def send_campaign(campaign_id: UUID):
 
     now = datetime.utcnow().isoformat()
 
-    # fetch campaign details to include message content/title in payload
     campaign = (
         supabase.table("campaigns")
         .select("*")
@@ -295,11 +390,11 @@ async def send_campaign(campaign_id: UUID):
 
     logs = []
     success_count = 0
-    for user in recipients:
+    for recipient in recipients:
         success = False
         try:
             success = await manager.send_to_user(
-                str(user["user_id"]),
+                str(recipient["user_id"]),
                 {
                     "type": "CAMPAIGN",
                     "campaign_id": str(campaign_id),
@@ -314,18 +409,16 @@ async def send_campaign(campaign_id: UUID):
             success_count += 1
         logs.append({
             "log_id": str(campaign_id),
-            "user_id": user["user_id"],
+            "user_id": recipient["user_id"],
             "notification_type": "CAMPAIGN",
             "status": "SUCCESS" if success else "FAILED",
             "sent_at": now,
         })
 
-    # write logs (best-effort)
     try:
         supabase.table("notification_logs").insert(logs).execute()
     except Exception:
         print("Warning: failed to insert notification logs")
-
 
     try:
         supabase.table("campaigns").update({
@@ -341,9 +434,8 @@ async def send_campaign(campaign_id: UUID):
         "failed_count": len(recipients) - success_count
     }
 
-
 @app.post("/test/notify/{user_id}")
-async def test_notify(user_id: str, message: Optional[str] = None):
+async def test_notify(user_id: str, message: Optional[str] = None, auth_user: dict = Depends(get_current_user)):
     """Send a simple test notification to a connected user and log the attempt."""
     payload = {
         "type": "TEST",
@@ -368,9 +460,8 @@ async def test_notify(user_id: str, message: Optional[str] = None):
 
     return {"sent": sent}
 
-
 @app.get("/newsletters")
-def list_newsletters():
+def list_newsletters(user: dict = Depends(get_current_user)):
     return (
         supabase
         .table("newsletters")
@@ -382,13 +473,12 @@ def list_newsletters():
     )
 
 @app.post("/newsletters")
-def create_newsletter(payload: NewsletterCreate):
+def create_newsletter(payload: NewsletterCreate, user: dict = Depends(get_current_user)):
     res = (
         supabase
         .table("newsletters")
         .insert({
             "news_name": payload.news_name,
-            #"notification_type": "promotional_offers",
             "city_filter": payload.city_filter,
             "content": payload.content,
             "created_by": str(payload.created_by),
@@ -399,7 +489,7 @@ def create_newsletter(payload: NewsletterCreate):
     )
 
     if not res.data:
-        raise HTTPException(status_code=500, detail="Failed to create campaign")
+        raise HTTPException(status_code=500, detail="Failed to create newsletter")
 
     return res.data[0]
 
@@ -425,9 +515,8 @@ def get_eligible_users_for_newsletter(newsletter_id: UUID):
         .data
     )
 
-    pref_key = "newsletters"
-    eligible = []
     pref_key = "newsletter"
+    eligible = []
 
     for user in users:
         prefs = user.get("user_preferences")
@@ -450,14 +539,13 @@ def get_eligible_users_for_newsletter(newsletter_id: UUID):
 
     return eligible
 
-
 @app.get("/newsletters/{newsletter_id}/recipients")
-def get_newsletter_recipients(newsletter_id: UUID):
+def get_newsletter_recipients(newsletter_id: UUID, user: dict = Depends(get_current_user)):
     recipients = get_eligible_users_for_newsletter(newsletter_id)
     return {"recipients": recipients}
 
 @app.post("/newsletters/{newsletter_id}/send")
-async def send_newsletter(newsletter_id: UUID):
+async def send_newsletter(newsletter_id: UUID, user: dict = Depends(get_current_user)):
     recipients = get_eligible_users_for_newsletter(newsletter_id)
 
     if not recipients:
@@ -465,7 +553,6 @@ async def send_newsletter(newsletter_id: UUID):
 
     now = datetime.utcnow().isoformat()
 
-    # fetch newsletter details to include content/title
     newsletter = (
         supabase.table("newsletters")
         .select("*")
@@ -481,11 +568,11 @@ async def send_newsletter(newsletter_id: UUID):
     logs = []
     success_count = 0
 
-    for user in recipients:
+    for recipient in recipients:
         success = False
         try:
             success = await manager.send_to_user(
-                str(user["user_id"]),
+                str(recipient["user_id"]),
                 {
                     "type": "NEWSLETTER",
                     "newsletter_id": str(newsletter_id),
@@ -501,19 +588,17 @@ async def send_newsletter(newsletter_id: UUID):
 
         logs.append({
             "log_id": str(newsletter_id),
-            "user_id": user["user_id"],
+            "user_id": recipient["user_id"],
             "notification_type": "NEWSLETTER",
             "status": "SUCCESS" if success else "FAILED",
             "sent_at": now,
         })
 
-    # write logs (best-effort)
     try:
         supabase.table("notification_logs").insert(logs).execute()
     except Exception:
         print("Warning: failed to insert newsletter notification logs")
 
-    # update newsletter status (best-effort)
     try:
         supabase.table("newsletters").update({
             "status": "SENT"
@@ -529,13 +614,11 @@ async def send_newsletter(newsletter_id: UUID):
     }
 
 # ---------------- USERS ----------------
-def build_default_password(name: str, phone: str) -> str:
-    return f"{name.lower().replace(' ', '')}{phone}"
-
 @app.post("/admin/users")
-def create_user(payload: CreateUserRequest):
+def create_user(payload: CreateUserRequest, user: dict = Depends(admin_only)):
     user_id = str(uuid.uuid4())
     password = build_default_password(payload.name, payload.phone)
+    hashed_password = hash_password(password)
 
     supabase.table("users").insert({
         "user_id": user_id,
@@ -544,7 +627,7 @@ def create_user(payload: CreateUserRequest):
         "phone": payload.phone,
         "city": payload.city,
         "gender": payload.gender,
-        "password": password,
+        "password": hashed_password,
         "is_active": True,
         "created_at": datetime.utcnow().isoformat(),
         "role_id": 4,
@@ -567,7 +650,7 @@ def create_user(payload: CreateUserRequest):
     return {"user_id": user_id}
 
 @app.get("/admin/users")
-def get_users():
+def get_users(user: dict = Depends(admin_only)):
     res = (
         supabase
         .table("users")
@@ -579,7 +662,7 @@ def get_users():
     return res.data or []
 
 @app.put("/admin/users/{user_id}")
-def update_user(user_id: str, payload: UpdateUserRequest):
+def update_user(user_id: str, payload: UpdateUserRequest, user: dict = Depends(admin_only)):
     res = (
         supabase
         .table("users")
@@ -590,8 +673,8 @@ def update_user(user_id: str, payload: UpdateUserRequest):
     return res.data[0]
 
 @app.patch("/admin/users/{user_id}/toggle-active")
-def toggle_user(user_id: str):
-    user = (
+def toggle_user(user_id: str, user: dict = Depends(admin_only)):
+    target_user = (
         supabase
         .table("users")
         .select("is_active")
@@ -600,7 +683,7 @@ def toggle_user(user_id: str):
         .execute()
     )
 
-    new_value = not user.data["is_active"]
+    new_value = not target_user.data["is_active"]
 
     supabase.table("users").update({
         "is_active": new_value
@@ -609,7 +692,7 @@ def toggle_user(user_id: str):
     return {"is_active": new_value}
 
 @app.get("/users/{user_id}/preferences")
-def get_user_preferences(user_id: str):
+def get_user_preferences(user_id: str, user: dict = Depends(get_current_user)):
     res = (
         supabase
         .table("user_preferences")
@@ -642,14 +725,12 @@ class UserPreferencesUpdate(BaseModel):
 @app.put("/users/{user_id}/preferences")
 def update_user_preferences(
     user_id: UUID,
-    prefs: UserPreferencesUpdate
+    prefs: UserPreferencesUpdate,
+    user: dict = Depends(get_current_user)
 ):
-    # only include fields that were provided (avoid overwriting with None)
     data = prefs.model_dump(exclude_none=True)
-
     resp = {"preferences": None, "notification_type": None}
 
-    # update top-level user_preferences columns if present
     user_fields = {k: data[k] for k in ("offers", "order_updates", "newsletter") if k in data}
     if user_fields:
         res = (
@@ -661,27 +742,18 @@ def update_user_preferences(
         )
         resp["preferences"] = res.data
 
-    # update/insert notification_type row when any channel fields are provided
     channel_keys = (
-        "campaign_email",
-        "campaign_sms",
-        "campaign_push",
-        "newsletter_email",
-        "newsletter_sms",
-        "newsletter_push",
-        "update_email",
-        "update_sms",
-        "update_push",
+        "campaign_email", "campaign_sms", "campaign_push",
+        "newsletter_email", "newsletter_sms", "newsletter_push",
+        "update_email", "update_sms", "update_push",
     )
     notif_fields = {k: data[k] for k in channel_keys if k in data}
     if notif_fields:
         payload = {"user_id": str(user_id), **notif_fields}
-        # upsert so we create a row if one doesn't exist, or update if it does
         res2 = supabase.table("notification_type").upsert(payload).execute()
         resp["notification_type"] = res2.data
 
     return {"success": True, "data": resp}
-
 
 class NotificationChannelUpdate(BaseModel):
     email: bool
@@ -691,7 +763,8 @@ class NotificationChannelUpdate(BaseModel):
 @app.put("/users/{user_id}/channels")
 def update_notification_channels(
     user_id: UUID,
-    channels: NotificationChannelUpdate
+    channels: NotificationChannelUpdate,
+    user: dict = Depends(get_current_user)
 ):
     res = (
         supabase
@@ -700,11 +773,10 @@ def update_notification_channels(
         .eq("user_id", str(user_id))
         .execute()
     )
-
     return {"success": True, "data": res.data}
 
 @app.get("/users/{user_id}/channels")
-def get_notification_channels(user_id: UUID):
+def get_notification_channels(user_id: UUID, user: dict = Depends(get_current_user)):
     res = (
         supabase
         .table("notification_type")
@@ -720,7 +792,7 @@ def get_notification_channels(user_id: UUID):
     return res.data
 
 @app.post("/admin/users/upload-csv")
-def upload_users_csv(file: UploadFile = File(...)):
+def upload_users_csv(file: UploadFile = File(...), user: dict = Depends(admin_only)):
     try:
         content = file.file.read().decode("utf-8").splitlines()
         reader = csv.DictReader(content)
@@ -729,7 +801,7 @@ def upload_users_csv(file: UploadFile = File(...)):
 
     users = []
     prefs = []
-    type = []
+    type_data = []
 
     for row in reader:
         if not row.get("name") or not row.get("email") or not row.get("phone"):
@@ -737,6 +809,7 @@ def upload_users_csv(file: UploadFile = File(...)):
 
         user_id = str(uuid.uuid4())
         password = build_default_password(row["name"], row["phone"])
+        hashed_password = hash_password(password)
 
         users.append({
             "user_id": user_id,
@@ -745,7 +818,7 @@ def upload_users_csv(file: UploadFile = File(...)):
             "phone": row["phone"].strip(),
             "city": row["city"],
             "gender": row.get("gender"),
-            "password": password,
+            "password": hashed_password,
             "is_active": True,
             "created_at": datetime.utcnow().isoformat(),
             "role_id": 4,
@@ -758,13 +831,12 @@ def upload_users_csv(file: UploadFile = File(...)):
             "newsletter": True,
         })
 
-        type.append({
+        type_data.append({
             "user_id": user_id,
             "email": True,
             "sms": True,
             "push": True,
         })
-    
 
     if not users:
         raise HTTPException(status_code=400, detail="No valid users found in CSV")
@@ -777,7 +849,7 @@ def upload_users_csv(file: UploadFile = File(...)):
     if not pref_res.data:
         raise HTTPException(status_code=500, detail="Failed to insert preferences")
     
-    type_res = supabase.table("notification_type").insert(type).execute()
+    type_res = supabase.table("notification_type").insert(type_data).execute()
     if not type_res.data:
         raise HTTPException(status_code=500, detail="Failed to insert notification types")
 
@@ -790,7 +862,7 @@ class CreateOrderRequest(BaseModel):
     order_name: str
 
 @app.post("/users/{user_id}/orders")
-def create_order(user_id: UUID, payload: CreateOrderRequest):
+def create_order(user_id: UUID, payload: CreateOrderRequest, user: dict = Depends(get_current_user)):
     order_id = str(uuid.uuid4())
 
     res = (
@@ -799,7 +871,7 @@ def create_order(user_id: UUID, payload: CreateOrderRequest):
         .insert({
             "order_id": order_id,
             "user_id": str(user_id),
-            "order_name": payload.order_name,  # ✅ dynamic
+            "order_name": payload.order_name,
             "status": "PLACED",
         })
         .execute()
@@ -811,7 +883,7 @@ def create_order(user_id: UUID, payload: CreateOrderRequest):
     return res.data[0]
 
 @app.get("/admin/orders")
-def admin_orders():
+def admin_orders(user: dict = Depends(admin_only)):
     res = (
         supabase
         .table("orders")
@@ -821,9 +893,8 @@ def admin_orders():
     )
     return res.data or []
 
-
 @app.get("/users/{user_id}/orders")
-def get_user_orders(user_id: UUID):
+def get_user_orders(user_id: UUID, user: dict = Depends(get_current_user)):
     res = (
         supabase
         .table("orders")
@@ -835,7 +906,7 @@ def get_user_orders(user_id: UUID):
     return res.data or []
 
 @app.post("/users/{user_id}/orders/{order_id}/request-update")
-def request_order_update(user_id: UUID, order_id: UUID):
+def request_order_update(user_id: UUID, order_id: UUID, user: dict = Depends(get_current_user)):
     supabase.table("orders").update({
         "status": "UPDATE_REQUESTED"
     }).eq("order_id", str(order_id)).eq("user_id", str(user_id)).execute()
@@ -851,7 +922,7 @@ def request_order_update(user_id: UUID, order_id: UUID):
     return {"message": "Update requested"}
 
 @app.post("/admin/users/{user_id}/orders/{order_id}/send-update")
-def send_order_update(user_id: UUID, order_id: UUID):
+def send_order_update(user_id: UUID, order_id: UUID, user: dict = Depends(admin_only)):
     supabase.table("orders").update({
         "status": "SENT"
     }).eq("order_id", str(order_id)).execute()
@@ -866,3 +937,80 @@ def send_order_update(user_id: UUID, order_id: UUID):
 
     return {"message": "Order update sent"}
 
+# Add this endpoint to your main.py file
+
+# ---------------- NOTIFICATION LOGS ----------------
+@app.get("/admin/notification-logs")
+def get_notification_logs(user: dict = Depends(get_current_user)):
+    """
+    Get all notification logs.
+    Can be accessed by authenticated users.
+    Admins can see all logs, users can see their own.
+    """
+    try:
+        # If admin, return all logs
+        if user["role_id"] == 1:
+            res = (
+                supabase
+                .table("notification_logs")
+                .select("*")
+                .order("sent_at", desc=True)
+                .execute()
+            )
+        else:
+            # Regular users see only their own logs
+            res = (
+                supabase
+                .table("notification_logs")
+                .select("*")
+                .eq("user_id", user["user_id"])
+                .order("sent_at", desc=True)
+                .execute()
+            )
+        
+        return res.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch logs: {str(e)}")
+
+@app.get("/admin/notification-logs/campaign/{campaign_id}")
+def get_campaign_logs(campaign_id: UUID, user: dict = Depends(get_current_user)):
+    """Get logs for a specific campaign"""
+    try:
+        res = (
+            supabase
+            .table("notification_logs")
+            .select("*")
+            .eq("log_id", str(campaign_id))
+            .order("sent_at", desc=True)
+            .execute()
+        )
+        
+        return res.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch campaign logs: {str(e)}")
+
+@app.get("/admin/notification-logs/stats")
+def get_notification_stats(user: dict = Depends(admin_only)):
+    """Get notification statistics"""
+    try:
+        res = (
+            supabase
+            .table("notification_logs")
+            .select("*")
+            .execute()
+        )
+        
+        logs = res.data or []
+        
+        total = len(logs)
+        success = len([log for log in logs if log["status"] == "SUCCESS"])
+        failed = len([log for log in logs if log["status"] == "FAILED"])
+        
+        return {
+            "total": total,
+            "success": success,
+            "failed": failed,
+            "success_rate": round((success / total * 100) if total > 0 else 0, 2)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch stats: {str(e)}")
