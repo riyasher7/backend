@@ -1,0 +1,66 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebSocket Notification Tester</title>
+  <style>
+    body{font-family: Arial, Helvetica, sans-serif; padding:20px}
+    label{display:block;margin-top:10px}
+    #log{border:1px solid #ddd;padding:10px;height:200px;overflow:auto;background:#f9f9f9}
+    button{margin-top:8px}
+  </style>
+</head>
+<body>
+  <h2>WebSocket Notification Tester</h2>
+  <label>User ID: <input id="userId" value="user-123" /></label>
+  <label>Server URL: <input id="server" value="ws://127.0.0.1:9100/ws/notifications/" style="width:400px" /></label>
+  <div>
+    <button id="connect">Connect</button>
+    <button id="disconnect" disabled>Disconnect</button>
+  </div>
+  <label>Campaign ID (for /campaigns/{id}/send): <input id="campaignId" placeholder="paste campaign id (optional)" style="width:320px"/></label>
+  <div>
+    <button id="sendCampaign">Trigger Campaign Send (POST)</button>
+  </div>
+  <h3>Log</h3>
+  <div id="log"></div>
+
+<script>
+let ws;
+const logEl = document.getElementById('log');
+function log(s){ const d=document.createElement('div'); d.textContent = typeof s==='string'?s:JSON.stringify(s); logEl.appendChild(d); logEl.scrollTop = logEl.scrollHeight }
+
+document.getElementById('connect').addEventListener('click', ()=>{
+  const userId = document.getElementById('userId').value.trim();
+  const server = document.getElementById('server').value.trim();
+  if(!userId){ alert('Enter user id'); return }
+  const url = server.endsWith('/')? server + userId : server + '/' + userId;
+  ws = new WebSocket(url);
+  ws.onopen = () => { log('Connected to ' + url); document.getElementById('connect').disabled = true; document.getElementById('disconnect').disabled = false };
+  ws.onmessage = e => { log('RECV: ' + e.data) };
+  ws.onclose = () => { log('WebSocket closed'); document.getElementById('connect').disabled = false; document.getElementById('disconnect').disabled = true };
+  ws.onerror = e => { log('ERROR: ' + JSON.stringify(e)) };
+});
+
+document.getElementById('disconnect').addEventListener('click', ()=>{
+  if(ws) ws.close();
+});
+
+// Trigger campaign send via POST to server (assumes same origin/host where API runs)
+document.getElementById('sendCampaign').addEventListener('click', async ()=>{
+  const campaignId = document.getElementById('campaignId').value.trim();
+  if(!campaignId){ alert('Enter campaign id'); return }
+  const url = window.location.origin.replace(/^http/, 'http') + `/campaigns/${campaignId}/send`;
+  log('POST ' + url);
+  try{
+    const r = await fetch(url, { method:'POST' });
+    const t = await r.text();
+    log('SEND RESULT: ' + r.status + ' ' + t);
+  }catch(err){ log('POST ERROR: ' + err) }
+});
+
+// handy: send a ping every 30s to keep socket alive
+setInterval(()=>{ if(ws && ws.readyState===1){ try{ ws.send(JSON.stringify({type:'PING'})) }catch(e){} } }, 30000);
+</script>
+</body>
+</html>

@@ -8,7 +8,7 @@ from uuid import UUID
 import uuid
 import csv
 from ws import router as ws_router
-#from websocket_manager import manager
+from websocket_manager import manager
 
 app = FastAPI()
 
@@ -18,6 +18,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
+        "http://localhost:5174",
         "http://127.0.0.1:5173",
         "http://localhost:9100",
         "http://127.0.0.1:9100",
@@ -224,38 +225,102 @@ def get_campaign_recipients(campaign_id: UUID):
     return {"recipients": recipients}
 
 @app.post("/campaigns/{campaign_id}/send")
-def send_campaign(campaign_id: UUID):
+async def send_campaign(campaign_id: UUID):
     recipients = get_eligible_users_for_campaign(campaign_id)
 
     if not recipients:
-        return {
-            "status": "sent",
-            "sent_to": 0
-        }
+        return {"status": "sent", "sent_to": 0}
 
     now = datetime.utcnow().isoformat()
 
-    logs = [
-        {
+    # fetch campaign details to include message content/title in payload
+    campaign = (
+        supabase.table("campaigns")
+        .select("*")
+        .eq("campaign_id", str(campaign_id))
+        .single()
+        .execute()
+        .data
+    )
+
+    title = campaign.get("campaign_name", "New Campaign") if campaign else "New Campaign"
+    content = campaign.get("content", "") if campaign else ""
+
+    logs = []
+    success_count = 0
+    for user in recipients:
+        success = False
+        try:
+            success = await manager.send_to_user(
+                str(user["user_id"]),
+                {
+                    "type": "CAMPAIGN",
+                    "campaign_id": str(campaign_id),
+                    "title": title,
+                    "content": content,
+                }
+            )
+        except Exception:
+            success = False
+
+        if success:
+            success_count += 1
+        logs.append({
             "log_id": str(campaign_id),
             "user_id": user["user_id"],
             "notification_type": "CAMPAIGN",
-            "status": "SUCCESS",
+            "status": "SUCCESS" if success else "FAILED",
             "sent_at": now,
-        }
-        for user in recipients
-    ]
+        })
 
-    supabase.table("notification_logs").insert(logs).execute()
+    # write logs (best-effort)
+    try:
+        supabase.table("notification_logs").insert(logs).execute()
+    except Exception:
+        print("Warning: failed to insert notification logs")
 
-    supabase.table("campaigns").update({
-        "status": "SENT"
-    }).eq("campaign_id", str(campaign_id)).execute()
+
+    try:
+        supabase.table("campaigns").update({
+            "status": "SENT"
+        }).eq("campaign_id", str(campaign_id)).execute()
+    except Exception:
+        print("Warning: failed to update campaign status")
 
     return {
         "status": "SENT",
-        "sent_to": len(recipients)
+        "sent_to": len(recipients),
+        "success_count": success_count,
+        "failed_count": len(recipients) - success_count
     }
+
+
+@app.post("/test/notify/{user_id}")
+async def test_notify(user_id: str, message: Optional[str] = None):
+    """Send a simple test notification to a connected user and log the attempt."""
+    payload = {
+        "type": "TEST",
+        "message": message or "Test notification",
+    }
+    sent = False
+    try:
+        sent = await manager.send_to_user(user_id, payload)
+    except Exception:
+        sent = False
+
+    try:
+        supabase.table("notification_logs").insert({
+            "log_id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "notification_type": "TEST",
+            "status": "SUCCESS" if sent else "FAILED",
+            "sent_at": datetime.utcnow().isoformat(),
+        }).execute()
+    except Exception:
+        print("Warning: failed to insert test notification log")
+
+    return {"sent": sent}
+
 
 @app.get("/newsletters")
 def list_newsletters():
@@ -345,37 +410,75 @@ def get_newsletter_recipients(newsletter_id: UUID):
     return {"recipients": recipients}
 
 @app.post("/newsletters/{newsletter_id}/send")
-def send_newsletter(newsletter_id: UUID):
+async def send_newsletter(newsletter_id: UUID):
     recipients = get_eligible_users_for_newsletter(newsletter_id)
 
     if not recipients:
-        return {
-            "status": "SENT",
-            "sent_to": 0
-        }
+        return {"status": "SENT", "sent_to": 0, "success_count": 0, "failed_count": 0}
 
     now = datetime.utcnow().isoformat()
 
-    logs = [
-        {
+    # fetch newsletter details to include content/title
+    newsletter = (
+        supabase.table("newsletters")
+        .select("*")
+        .eq("newsletter_id", str(newsletter_id))
+        .single()
+        .execute()
+        .data
+    )
+
+    title = newsletter.get("news_name", "Newsletter") if newsletter else "Newsletter"
+    content = newsletter.get("content", "") if newsletter else ""
+
+    logs = []
+    success_count = 0
+
+    for user in recipients:
+        success = False
+        try:
+            success = await manager.send_to_user(
+                str(user["user_id"]),
+                {
+                    "type": "NEWSLETTER",
+                    "newsletter_id": str(newsletter_id),
+                    "title": title,
+                    "content": content,
+                }
+            )
+        except Exception:
+            success = False
+
+        if success:
+            success_count += 1
+
+        logs.append({
             "log_id": str(newsletter_id),
             "user_id": user["user_id"],
             "notification_type": "NEWSLETTER",
-            "status": "SUCCESS",
+            "status": "SUCCESS" if success else "FAILED",
             "sent_at": now,
-        }
-        for user in recipients
-    ]
+        })
 
-    supabase.table("notification_logs").insert(logs).execute()
+    # write logs (best-effort)
+    try:
+        supabase.table("notification_logs").insert(logs).execute()
+    except Exception:
+        print("Warning: failed to insert newsletter notification logs")
 
-    supabase.table("newsletters").update({
-        "status": "SENT"
-    }).eq("newsletter_id", str(newsletter_id)).execute()
+    # update newsletter status (best-effort)
+    try:
+        supabase.table("newsletters").update({
+            "status": "SENT"
+        }).eq("newsletter_id", str(newsletter_id)).execute()
+    except Exception:
+        print("Warning: failed to update newsletter status")
 
     return {
         "status": "SENT",
-        "sent_to": len(recipients)
+        "sent_to": len(recipients),
+        "success_count": success_count,
+        "failed_count": len(recipients) - success_count
     }
 
 # ---------------- USERS ----------------
