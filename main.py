@@ -7,9 +7,12 @@ from typing import Optional
 from uuid import UUID
 import uuid
 import csv
+from ws import router as ws_router
+#from websocket_manager import manager
 
 app = FastAPI()
 
+app.include_router(ws_router)
 # ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
@@ -646,13 +649,29 @@ def request_order_update(user_id: UUID, order_id: UUID):
         "status": "UPDATE_REQUESTED"
     }).eq("order_id", str(order_id)).eq("user_id", str(user_id)).execute()
 
+    supabase.table("notification_logs").insert({
+        "log_id": str(uuid.uuid4()),
+        "user_id": str(user_id),
+        "notification_type": "ORDER_UPDATE",
+        "status": "PENDING",
+        "sent_at": datetime.utcnow().isoformat(),
+    }).execute()
+
     return {"message": "Update requested"}
 
-@app.post("/admin/orders/{order_id}/send-update")
-def send_order_update(order_id: UUID):
+@app.post("/admin/users/{user_id}/orders/{order_id}/send-update")
+def send_order_update(user_id: UUID, order_id: UUID):
     supabase.table("orders").update({
         "status": "SENT"
     }).eq("order_id", str(order_id)).execute()
+
+    supabase.table("notification_logs").insert({
+        "log_id": str(uuid.uuid4()),
+        "user_id": str(user_id),
+        "notification_type": "ORDER_UPDATE",
+        "status": "SUCCESS",
+        "sent_at": datetime.utcnow().isoformat(),
+    }).execute()
 
     return {"message": "Order update sent"}
 
