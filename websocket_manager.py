@@ -1,6 +1,6 @@
-# websocket_manager.py
 from typing import Dict
 from fastapi import WebSocket
+from supabase_client import supabase
 
 class ConnectionManager:
     def __init__(self):
@@ -33,5 +33,30 @@ class ConnectionManager:
             except Exception:
                 # remove dead connection to avoid repeated errors
                 self.disconnect(user_id)
+
+    async def flush_pending(self, user_id: str):
+        """Send any queued notifications for user_id stored in `pending_notifications` table."""
+        ws = self.active_connections.get(user_id)
+        if not ws:
+            return
+        try:
+            res = supabase.table("pending_notifications").select("*").eq("user_id", user_id).execute()
+            pending = res.data or []
+        except Exception:
+            print(f"Warning: failed to read pending_notifications for {user_id}")
+            return
+
+        for item in pending:
+            payload = item.get("payload") if isinstance(item, dict) else item
+            try:
+                await ws.send_json(payload)
+                # delete pending notification after successful send
+                try:
+                    supabase.table("pending_notifications").delete().eq("id", item.get("id")).execute()
+                except Exception:
+                    print("Warning: failed to delete pending notification", item.get("id"))
+            except Exception:
+                print(f"Warning: failed to send queued notification to {user_id}")
+                # keep pending if send failed
 
 manager = ConnectionManager()

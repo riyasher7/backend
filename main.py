@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from datetime import datetime
 from supabase_client import supabase
 from typing import Optional
@@ -69,6 +69,15 @@ class UpdateUserRequest(BaseModel):
     city: str
     gender: Optional[str] = None
 
+class SignUp(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    gender: str
+    city: str
+    phone: str
+
+
 
 def admin_only():
     return {"employee_id" : 1, "role" : "admin"}
@@ -88,7 +97,6 @@ def user_login(payload: LoginRequest):
         .eq("is_active", True)
         .execute()
     )
-
     if not res.data:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
@@ -103,6 +111,44 @@ def user_login(payload: LoginRequest):
         "name": user["name"],
         "role_id": user["role_id"],
     }
+
+@app.post("/auth/user/signup")
+def user_signup(payload: SignUp):
+    existing = (
+        supabase
+        .table("users")
+        .select("*")
+        .eq("email", payload.email)
+        .execute()
+    )
+    if existing.data:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user_id = str(uuid.uuid4())
+    supabase.table("users").insert({
+        "user_id": user_id,
+        "name": payload.name,
+        "email": payload.email,
+        "password": payload.password,
+        "phone": payload.phone,
+        "is_active": True,
+        "created_at": datetime.utcnow().isoformat(),
+        "gender": payload.gender,
+        "city": payload.city,
+        "role_id": 4,
+    }).execute()
+
+    supabase.table("user_preferences").insert({
+        "user_id": user_id,
+        "offers": True,
+        "order_updates": True,
+        "newsletter": True
+    }).execute()
+
+    supabase.table("notification_type").insert({
+        "user_id": user_id
+    }).execute()
+
+    return {"user_id": user_id, "email": payload.email, "name": payload.name}
 
 @app.get("/admin/employeesmgmt")
 def list_employees(_: dict = Depends(admin_only)):
@@ -189,6 +235,7 @@ def get_eligible_users_for_campaign(campaign_id: UUID):
         supabase.table("users")
         .select("user_id, name, email, city, user_preferences(*)")
         .eq("is_active", True)
+        .eq("role_id", 4)
         .execute()
         .data
     )
@@ -576,24 +623,65 @@ def get_user_preferences(user_id: str):
     return res.data
 
 class UserPreferencesUpdate(BaseModel):
-    offers: bool
-    order_updates: bool
-    newsletter: bool
+    offers: Optional[bool] = None
+    order_updates: Optional[bool] = None
+    newsletter: Optional[bool] = None
+
+    campaign_email: Optional[bool] = None
+    campaign_sms: Optional[bool] = None
+    campaign_push: Optional[bool] = None
+
+    newsletter_email: Optional[bool] = None
+    newsletter_sms: Optional[bool] = None
+    newsletter_push: Optional[bool] = None
+
+    update_email: Optional[bool] = None
+    update_sms: Optional[bool] = None
+    update_push: Optional[bool] = None
 
 @app.put("/users/{user_id}/preferences")
 def update_user_preferences(
     user_id: UUID,
     prefs: UserPreferencesUpdate
 ):
-    res = (
-        supabase
-        .table("user_preferences")
-        .update(prefs.model_dump())
-        .eq("user_id", str(user_id))
-        .execute()
-    )
+    # only include fields that were provided (avoid overwriting with None)
+    data = prefs.model_dump(exclude_none=True)
 
-    return {"success": True, "data": res.data}
+    resp = {"preferences": None, "notification_type": None}
+
+    # update top-level user_preferences columns if present
+    user_fields = {k: data[k] for k in ("offers", "order_updates", "newsletter") if k in data}
+    if user_fields:
+        res = (
+            supabase
+            .table("user_preferences")
+            .update(user_fields)
+            .eq("user_id", str(user_id))
+            .execute()
+        )
+        resp["preferences"] = res.data
+
+    # update/insert notification_type row when any channel fields are provided
+    channel_keys = (
+        "campaign_email",
+        "campaign_sms",
+        "campaign_push",
+        "newsletter_email",
+        "newsletter_sms",
+        "newsletter_push",
+        "update_email",
+        "update_sms",
+        "update_push",
+    )
+    notif_fields = {k: data[k] for k in channel_keys if k in data}
+    if notif_fields:
+        payload = {"user_id": str(user_id), **notif_fields}
+        # upsert so we create a row if one doesn't exist, or update if it does
+        res2 = supabase.table("notification_type").upsert(payload).execute()
+        resp["notification_type"] = res2.data
+
+    return {"success": True, "data": resp}
+
 
 class NotificationChannelUpdate(BaseModel):
     email: bool

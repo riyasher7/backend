@@ -13,3 +13,4 @@ async def notifications_ws(websocket: WebSocket, user_id: str):
         pass
     finally:
         manager.disconnect(user_id)
+
