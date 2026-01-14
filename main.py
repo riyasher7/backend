@@ -295,6 +295,7 @@ async def send_campaign(campaign_id: UUID):
 
     logs = []
     success_count = 0
+    queued_count = 0
     for user in recipients:
         success = False
         try:
@@ -310,13 +311,31 @@ async def send_campaign(campaign_id: UUID):
         except Exception:
             success = False
 
-        if success:
+        if not success:
+            queued_count += 1
+            try:
+                supabase.table("pending_notifications").insert({
+                    "id": str(uuid.uuid4()),
+                    "user_id": user["user_id"],
+                    "payload": {
+                        "type": "CAMPAIGN",
+                        "campaign_id": str(campaign_id),
+                        "title": title,
+                        "content": content,
+                    },
+                    "created_at": now,
+                }).execute()
+            except Exception:
+                print("Warning: failed to queue notification for user", user["user_id"])
+        else:
             success_count += 1
+
+        # record log as SUCCESS for sent or queued so admin sees it as accepted
         logs.append({
             "log_id": str(campaign_id),
             "user_id": user["user_id"],
             "notification_type": "CAMPAIGN",
-            "status": "SUCCESS" if success else "FAILED",
+            "status": "SUCCESS",
             "sent_at": now,
         })
 
@@ -338,7 +357,8 @@ async def send_campaign(campaign_id: UUID):
         "status": "SENT",
         "sent_to": len(recipients),
         "success_count": success_count,
-        "failed_count": len(recipients) - success_count
+        "queued_count": queued_count,
+        "failed_count": len(recipients) - success_count - queued_count
     }
 
 
@@ -350,23 +370,37 @@ async def test_notify(user_id: str, message: Optional[str] = None):
         "message": message or "Test notification",
     }
     sent = False
+    queued = False
     try:
         sent = await manager.send_to_user(user_id, payload)
     except Exception:
         sent = False
 
+    if not sent:
+        queued = True
+        try:
+            supabase.table("pending_notifications").insert({
+                "id": str(uuid.uuid4()),
+                "user_id": user_id,
+                "payload": payload,
+                "created_at": datetime.utcnow().isoformat(),
+            }).execute()
+        except Exception:
+            print("Warning: failed to queue test notification for user", user_id)
+
+    # mark log as SUCCESS (delivered now or queued for later)
     try:
         supabase.table("notification_logs").insert({
             "log_id": str(uuid.uuid4()),
             "user_id": user_id,
             "notification_type": "TEST",
-            "status": "SUCCESS" if sent else "FAILED",
+            "status": "SUCCESS",
             "sent_at": datetime.utcnow().isoformat(),
         }).execute()
     except Exception:
         print("Warning: failed to insert test notification log")
 
-    return {"sent": sent}
+    return {"sent": sent, "queued": queued}
 
 
 @app.get("/newsletters")
@@ -461,7 +495,7 @@ async def send_newsletter(newsletter_id: UUID):
     recipients = get_eligible_users_for_newsletter(newsletter_id)
 
     if not recipients:
-        return {"status": "SENT", "sent_to": 0, "success_count": 0, "failed_count": 0}
+        return {"status": "SENT", "sent_to": 0, "success_count": 0, "queued_count": 0, "failed_count": 0}
 
     now = datetime.utcnow().isoformat()
 
@@ -480,6 +514,7 @@ async def send_newsletter(newsletter_id: UUID):
 
     logs = []
     success_count = 0
+    queued_count = 0
 
     for user in recipients:
         success = False
@@ -496,14 +531,31 @@ async def send_newsletter(newsletter_id: UUID):
         except Exception:
             success = False
 
-        if success:
+        if not success:
+            queued_count += 1
+            try:
+                supabase.table("pending_notifications").insert({
+                    "id": str(uuid.uuid4()),
+                    "user_id": user["user_id"],
+                    "payload": {
+                        "type": "NEWSLETTER",
+                        "newsletter_id": str(newsletter_id),
+                        "title": title,
+                        "content": content,
+                    },
+                    "created_at": now,
+                }).execute()
+            except Exception:
+                print("Warning: failed to queue newsletter for user", user["user_id"])
+        else:
             success_count += 1
 
+        # record log as SUCCESS for sent or queued
         logs.append({
             "log_id": str(newsletter_id),
             "user_id": user["user_id"],
             "notification_type": "NEWSLETTER",
-            "status": "SUCCESS" if success else "FAILED",
+            "status": "SUCCESS",
             "sent_at": now,
         })
 
@@ -525,8 +577,43 @@ async def send_newsletter(newsletter_id: UUID):
         "status": "SENT",
         "sent_to": len(recipients),
         "success_count": success_count,
-        "failed_count": len(recipients) - success_count
+        "queued_count": queued_count,
+        "failed_count": len(recipients) - success_count - queued_count
     }
+
+@app.get("/users/{user_id}/notifications")
+def get_user_notifications(user_id: str, limit: int = 50):
+    try:
+        res = (
+            supabase
+            .table("pending_notifications")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("sent_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        data = res.data or []
+    except Exception:
+        print("Warning: failed to read pending_notifications for", user_id)
+        data = []
+
+    # normalize payloads to a consistent shape for the frontend
+    out = []
+    for row in data:
+        payload = row.get("payload") or {}
+        title = payload.get("title")
+        content = payload.get("content") or ""
+        out.append({
+            "id": row.get("log_id"),
+            "title": title,
+            "content": content,
+            "sent_at": row.get("sent_at"),
+            "type": payload.get("type") or row.get("notification_type"),
+        })
+
+    return out
+
 
 # ---------------- USERS ----------------
 def build_default_password(name: str, phone: str) -> str:

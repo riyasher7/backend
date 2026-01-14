@@ -18,3 +18,4 @@ if __name__ == '__main__':
         print('Response:', r.text)
     except Exception as e:
         print('Request failed:', e)
+
