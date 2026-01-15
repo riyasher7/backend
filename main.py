@@ -84,6 +84,10 @@ class SignUp(BaseModel):
     city: str
     phone: str
 
+class CampaignSendRequest(BaseModel):
+    schedule_after_minutes: Optional[int] = 0
+
+
 # ---------------- AUTHENTICATION HELPERS ----------------
 def hash_password(password: str) -> str:
     """Hash a password using bcrypt"""
@@ -285,10 +289,13 @@ def delete_employee(employee_id: int, user: dict = Depends(admin_only)):
 # ---------------- CAMPAIGNS ----------------
 @app.get("/campaigns")
 def list_campaigns(user: dict = Depends(get_current_user)):
+    now = datetime.utcnow().isoformat()
+
     return (
         supabase
         .table("campaigns")
         .select("*")
+        .lte("created_at", now)   # 👈 filter added
         .order("created_at", desc=True)
         .execute()
         .data
@@ -368,13 +375,19 @@ def get_campaign_recipients(campaign_id: UUID, user: dict = Depends(get_current_
     return {"recipients": recipients}
 
 @app.post("/campaigns/{campaign_id}/send")
-async def send_campaign(campaign_id: UUID, user: dict = Depends(get_current_user)):
+async def send_campaign(campaign_id: UUID, body: CampaignSendRequest, user: dict = Depends(get_current_user)):
     recipients = get_eligible_users_for_campaign(campaign_id)
 
     if not recipients:
         return {"status": "sent", "sent_to": 0}
 
-    now = datetime.utcnow().isoformat()
+    now_dt = datetime.utcnow()
+    delay_minutes = body.schedule_after_minutes or 0
+    send_dt = now_dt + timedelta(minutes=delay_minutes)
+
+    now = now_dt.isoformat()
+    send_at = send_dt.isoformat()
+
 
     campaign = (
         supabase.table("campaigns")
@@ -391,48 +404,53 @@ async def send_campaign(campaign_id: UUID, user: dict = Depends(get_current_user
     logs = []
     success_count = 0
     queued_count = 0
-    for user in recipients:
+    for recipient in recipients:
+        is_scheduled = delay_minutes > 0
+        print(is_scheduled)
         success = False
-        try:
-            success = await manager.send_to_user(
-                str(recipient["user_id"]),
-                {
-                    "type": "CAMPAIGN",
-                    "campaign_id": str(campaign_id),
-                    "title": title,
-                    "content": content,
-                }
-            )
-        except Exception:
-            success = False
 
-        if not success:
+        if not is_scheduled:
+            try:
+                success = await manager.send_to_user(
+                    str(recipient["user_id"]),
+                    {
+                        "type": "CAMPAIGN",
+                        "campaign_id": str(campaign_id),
+                        "title": title,
+                        "content": content,
+                    }
+                )
+            except Exception:
+                success = False
+
+        if is_scheduled or not success:
             queued_count += 1
             try:
                 supabase.table("pending_notifications").insert({
                     "id": str(uuid.uuid4()),
-                    "user_id": user["user_id"],
+                    "user_id": recipient["user_id"],
                     "payload": {
                         "type": "CAMPAIGN",
                         "campaign_id": str(campaign_id),
                         "title": title,
                         "content": content,
+                        "send_at": send_at
                     },
                     "created_at": now,
                 }).execute()
             except Exception:
-                print("Warning: failed to queue notification for user", user["user_id"])
+                print("Warning: failed to queue notification for user", recipient["user_id"])
         else:
             success_count += 1
 
-        # record log as SUCCESS for sent or queued so admin sees it as accepted
         logs.append({
-            "log_id": str(campaign_id),
+            "log_id": str(uuid.uuid4()),
             "user_id": recipient["user_id"],
             "notification_type": "CAMPAIGN",
-            "status": "SUCCESS",
-            "sent_at": now,
+            "status": "PENDING" if is_scheduled else "SUCCESS",
+            "sent_at": send_at,
         })
+
 
     try:
         supabase.table("notification_logs").insert(logs).execute()
@@ -441,18 +459,21 @@ async def send_campaign(campaign_id: UUID, user: dict = Depends(get_current_user
 
     try:
         supabase.table("campaigns").update({
-            "status": "SENT"
-        }).eq("campaign_id", str(campaign_id)).execute()
+        "status": "SCHEDULED" if delay_minutes > 0 else "SENT"
+    }).eq("campaign_id", str(campaign_id)).execute()
+
     except Exception:
         print("Warning: failed to update campaign status")
 
     return {
-        "status": "SENT",
+        "status": "SCHEDULED" if delay_minutes > 0 else "SENT",
+        "send_at": send_at,
         "sent_to": len(recipients),
         "success_count": success_count,
         "queued_count": queued_count,
         "failed_count": len(recipients) - success_count - queued_count
     }
+
 
 @app.post("/test/notify/{user_id}")
 async def test_notify(user_id: str, message: Optional[str] = None, auth_user: dict = Depends(get_current_user)):
@@ -496,7 +517,7 @@ async def test_notify(user_id: str, message: Optional[str] = None, auth_user: di
 
 
 @app.get("/newsletters")
-def list_newsletters(user: dict = Depends(get_current_user)):
+async def list_newsletters(user: dict = Depends(get_current_user)):
     return (
         supabase
         .table("newsletters")
@@ -624,7 +645,7 @@ async def send_newsletter(newsletter_id: UUID, user: dict = Depends(get_current_
             try:
                 supabase.table("pending_notifications").insert({
                     "id": str(uuid.uuid4()),
-                    "user_id": user["user_id"],
+                    "user_id": recipient["user_id"],
                     "payload": {
                         "type": "NEWSLETTER",
                         "newsletter_id": str(newsletter_id),
@@ -668,15 +689,14 @@ async def send_newsletter(newsletter_id: UUID, user: dict = Depends(get_current_
     }
 
 @app.get("/users/{user_id}/notifications")
-def get_user_notifications(user_id: str, limit: int = 50):
+def get_user_notifications(user_id: str):
     try:
         res = (
             supabase
             .table("pending_notifications")
             .select("*")
             .eq("user_id", user_id)
-            .order("sent_at", desc=True)
-            .limit(limit)
+            .order("created_at", desc=True)
             .execute()
         )
         data = res.data or []
@@ -694,12 +714,11 @@ def get_user_notifications(user_id: str, limit: int = 50):
             "id": row.get("log_id"),
             "title": title,
             "content": content,
-            "sent_at": row.get("sent_at"),
+            "created_at": row.get("created_at"),
             "type": payload.get("type") or row.get("notification_type"),
         })
 
     return out
-
 
 # ---------------- USERS ----------------
 def build_default_password(name: str, phone: str) -> str:
@@ -924,9 +943,15 @@ def upload_users_csv(file: UploadFile = File(...), user: dict = Depends(admin_on
 
         type_data.append({
             "user_id": user_id,
-            "email": True,
-            "sms": True,
-            "push": True,
+            "campaign_email": True,
+            "campaign_sms": True,
+            "campaign_push": True,
+            "newsletter_email": True,
+            "newsletter_sms": True,
+            "newsletter_push": True,
+            "update_email": True,
+            "update_sms": True,
+            "update_push": True,
         })
 
     if not users:
