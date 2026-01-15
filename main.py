@@ -7,10 +7,13 @@ from typing import Optional
 from uuid import UUID
 import uuid
 import csv
+import io
 import secrets
 import bcrypt
 from ws import router as ws_router
 from websocket_manager import manager
+import re
+from typing import Optional
 
 app = FastAPI()
 
@@ -30,6 +33,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Add this helper function near the top of main.py (after imports)
+def is_valid_email(email: str) -> bool:
+    """
+    Validate email format using regex
+    """
+    # RFC 5322 compliant email regex (simplified version)
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return re.match(email_pattern, email) is not None
+
+def validate_email(email: str) -> str:
+    """
+    Validate and normalize email
+    Raises HTTPException if invalid
+    """
+    if not email or not email.strip():
+        raise HTTPException(status_code=400, detail="Email is required")
+    
+    email = email.strip().lower()  # Normalize: trim and lowercase
+    
+    if not is_valid_email(email):
+        raise HTTPException(status_code=400, detail="Invalid email format")
+    
+    if len(email) > 254:  # RFC 5321
+        raise HTTPException(status_code=400, detail="Email is too long")
+    
+    return email
 
 # ---------------- SESSION STORAGE ----------------
 # In production, use Redis or a database for session storage
@@ -152,6 +182,7 @@ def root():
 # ---------------- AUTH ----------------
 @app.post("/auth/user/login")
 def user_login(payload: LoginRequest):
+    email = validate_email(payload.email)
     res = (
         supabase
         .table("users")
@@ -182,6 +213,9 @@ def user_login(payload: LoginRequest):
 
 @app.post("/auth/user/signup")
 def user_signup(payload: SignUp):
+
+    email = validate_email(payload.email)
+
     existing = (
         supabase
         .table("users")
@@ -253,6 +287,7 @@ def get_current_user_info(user: dict = Depends(get_current_user)):
 
 @app.get("/admin/employeesmgmt")
 def list_employees(user: dict = Depends(admin_only)):
+    
     res = (
         supabase.table("users")
         .select("user_id, name, email, role_id")
@@ -264,6 +299,7 @@ def list_employees(user: dict = Depends(admin_only)):
 
 @app.post("/admin/employeesmgmt")
 def create_employee(data: EmployeeCreate, user: dict = Depends(admin_only)):
+    email = validate_email(data.email)
     hashed_password = hash_password(data.password)
     
     supabase.table("users").insert({
@@ -726,6 +762,7 @@ def build_default_password(name: str, phone: str) -> str:
 
 @app.post("/admin/users")
 def create_user(payload: CreateUserRequest, user: dict = Depends(admin_only)):
+    email = validate_email(payload.email)
     user_id = str(uuid.uuid4())
     password = build_default_password(payload.name, payload.phone)
     hashed_password = hash_password(password)
@@ -901,20 +938,76 @@ def get_notification_channels(user_id: UUID, user: dict = Depends(get_current_us
 
     return res.data
 
+@app.post("/admin/employeesmgmt")
+def create_employee(data: EmployeeCreate, user: dict = Depends(admin_only)):
+    # Validate email
+    email = validate_email(data.email)
+    
+    hashed_password = hash_password(data.password)
+    
+    supabase.table("users").insert({
+        "name": data.name,
+        "email": email,  # Use validated email
+        "password": hashed_password,
+        "role_id": data.role_id,
+        "created_at": datetime.utcnow().isoformat(),
+    }).execute()
+    return {"success": True}
+
+
+# 4. Update create_user endpoint
+@app.post("/admin/users")
+def create_user(payload: CreateUserRequest, user: dict = Depends(admin_only)):
+    # Validate email
+    email = validate_email(payload.email)
+    
+    user_id = str(uuid.uuid4())
+    password = build_default_password(payload.name, payload.phone)
+    hashed_password = hash_password(password)
+
+    supabase.table("users").insert({
+        "user_id": user_id,
+        "name": payload.name,
+        "email": email,  # Use validated email
+        "phone": payload.phone,
+        "city": payload.city,
+        "gender": payload.gender,
+        "password": hashed_password,
+        "is_active": True,
+        "created_at": datetime.utcnow().isoformat(),
+        "role_id": 4,
+    }).execute()
+
+    # ... rest of the code
+
+
+# 5. Update CSV upload endpoint
 @app.post("/admin/users/upload-csv")
-def upload_users_csv(file: UploadFile = File(...), user: dict = Depends(admin_only)):
+async def upload_users_csv(
+    file: UploadFile = File(...),
+    user: dict = Depends(admin_only)
+):
     try:
-        content = file.file.read().decode("utf-8").splitlines()
-        reader = csv.DictReader(content)
+        contents = await file.read()
+        text = contents.decode("utf-8", errors="replace")
+        stream = io.StringIO(text)
+        reader = csv.DictReader(stream)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid CSV file")
 
     users = []
-    prefs = []
-    type_data = []
+    errors = []
 
-    for row in reader:
+    for row_num, row in enumerate(reader, start=2):
         if not row.get("name") or not row.get("email") or not row.get("phone"):
+            errors.append(f"Row {row_num}: Missing required fields")
+            continue
+
+        # Validate email
+        try:
+            email = validate_email(row["email"])
+        except HTTPException as e:
+            errors.append(f"Row {row_num}: {e.detail}")
             continue
 
         user_id = str(uuid.uuid4())
@@ -924,10 +1017,10 @@ def upload_users_csv(file: UploadFile = File(...), user: dict = Depends(admin_on
         users.append({
             "user_id": user_id,
             "name": row["name"].strip(),
-            "email": row["email"].strip(),
+            "email": email,
             "phone": row["phone"].strip(),
-            "city": row["city"],
-            "gender": row.get("gender"),
+            "city": (row.get("city") or "").strip() or None,
+            "gender": (row.get("gender") or "").strip() or None,
             "password": hashed_password,
             "is_active": True,
             "created_at": datetime.utcnow().isoformat(),
@@ -956,23 +1049,53 @@ def upload_users_csv(file: UploadFile = File(...), user: dict = Depends(admin_on
 
     if not users:
         raise HTTPException(status_code=400, detail="No valid users found in CSV")
-    
-    user_res = supabase.table("users").insert(users).execute()
-    if not user_res.data:
-        raise HTTPException(status_code=500, detail="Failed to insert users")
-    
-    pref_res = supabase.table("user_preferences").insert(prefs).execute()
-    if not pref_res.data:
-        raise HTTPException(status_code=500, detail="Failed to insert preferences")
-    
-    type_res = supabase.table("notification_type").insert(type_data).execute()
-    if not type_res.data:
-        raise HTTPException(status_code=500, detail="Failed to insert notification types")
+
+    # Check for existing emails to avoid duplicates
+    # Check for existing emails to avoid duplicates
+    emails = [u["email"] for u in users]
+    try:
+        existing_res = (
+            supabase.table("users")
+            .select("email")
+            .in_("email", emails)
+            .execute()
+        )
+        existing_emails = {r["email"] for r in (existing_res.data or [])}
+    except Exception as e:
+        print("Error checking existing emails:", e)
+        existing_emails = set()
+
+
+    to_insert_users = [u for u in users if u["email"] not in existing_emails]
+    if not to_insert_users:
+        raise HTTPException(status_code=400, detail="All emails already exist")
+
+    prefs_to_insert = [
+        {"user_id": u["user_id"], "offers": True, "order_updates": True, "newsletter": True}
+        for u in to_insert_users
+    ]
+    types_to_insert = [
+        {"user_id": u["user_id"], "email": True, "sms": True, "push": True}
+        for u in to_insert_users
+    ]
+
+    # Insert into Supabase
+    try:
+        supabase.table("users").insert(to_insert_users).execute()
+        supabase.table("user_preferences").insert(prefs_to_insert).execute()
+        supabase.table("notification_type").insert(types_to_insert).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to insert users: {str(e)}")
+
+    inserted_count = len(to_insert_users)
 
     return {
-        "status": "success",
-        "created": len(users)
+        "message": "Users uploaded successfully",
+        "requested": len(users),
+        "inserted": inserted_count,
+        "skipped_existing": len(users) - inserted_count
     }
+
 
 class CreateOrderRequest(BaseModel):
     order_name: str
